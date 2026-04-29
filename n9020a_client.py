@@ -45,18 +45,25 @@ class N9020AClient:
         return str(self._inst.query(cmd)).strip()
 
     def fetch_csv_text(self) -> str:
-        """Fetch measurement as CSV text.
+        """Fetch measurement as CSV text from instrument memory.
 
-        NOTE: Different firmware/modes may require different SCPI sequences.
-        Adjust this function according to your instrument setup.
+        SCPI sequence:
+        1) Disable continuous scan.
+        2) Trigger one immediate scan.
+        3) Store trace data to instrument file.
+        4) Read file back via MMEM:DATA?.
         """
         if self._inst is None:
             raise RuntimeError("Instrument not connected")
 
-        # Common approach: ask trace data and convert to CSV lines.
-        # For N9020A, TRACE:DATA? usually returns comma-separated values.
-        raw = self.query("TRACE:DATA?")
+        remote_path = r'C:\data.csv'
+        self.write(":INIT:CONT OFF")
+        self.write(":INIT:IMM")
+        self.write(f'MMEM:STOR:TRAC:DATA TRAC1, "{remote_path}"')
+        raw = self.query(f':MMEM:DATA? "{remote_path}"')
         if not raw:
             raise RuntimeError("Empty data returned from instrument")
 
-        return "value\n" + "\n".join(raw.split(","))
+        # The returned payload may already be CSV text; normalize line endings.
+        csv_text = raw.replace("\r\n", "\n").strip()
+        return csv_text
