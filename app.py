@@ -5,8 +5,10 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+import shutil
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QTimer, Qt, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -34,6 +36,7 @@ class CollectorState:
     interval_sec: int = 5
     total_count: int = 100
     current_index: int = 1
+    remote_csv_path: str = r"D:\\data.csv"
 
 
 class MainWindow(QMainWindow):
@@ -65,9 +68,18 @@ class MainWindow(QMainWindow):
         self.folder_edit = QLineEdit()
         self.folder_btn = QPushButton("选择...")
         self.folder_btn.clicked.connect(self._choose_folder)
+        self.open_folder_btn = QPushButton("打开文件夹")
+        self.open_folder_btn.clicked.connect(self._open_folder)
+        self.clear_folder_btn = QPushButton("清空文件夹")
+        self.clear_folder_btn.clicked.connect(self._clear_folder)
         folder_row.addWidget(self.folder_edit)
         folder_row.addWidget(self.folder_btn)
+        folder_row.addWidget(self.open_folder_btn)
+        folder_row.addWidget(self.clear_folder_btn)
         form.addRow("存储文件夹", folder_row)
+
+        self.remote_csv_edit = QLineEdit()
+        form.addRow("仪表CSV路径", self.remote_csv_edit)
 
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(1, 3600)
@@ -115,6 +127,7 @@ class MainWindow(QMainWindow):
         self.state.folder = self.folder_edit.text().strip()
         self.state.interval_sec = self.interval_spin.value()
         self.state.total_count = self.total_spin.value()
+        self.state.remote_csv_path = self.remote_csv_edit.text().strip() or r"D:\\data.csv"
         STATE_FILE.write_text(
             json.dumps(asdict(self.state), ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -125,6 +138,7 @@ class MainWindow(QMainWindow):
         self.folder_edit.setText(self.state.folder)
         self.interval_spin.setValue(self.state.interval_sec)
         self.total_spin.setValue(self.state.total_count)
+        self.remote_csv_edit.setText(self.state.remote_csv_path or r"D:\\data.csv")
 
     def _choose_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "选择输出文件夹")
@@ -147,7 +161,8 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            self.client = N9020AClient(N9020AConfig(resource=addr))
+            remote_csv_path = self.remote_csv_edit.text().strip() or r"D:\\data.csv"
+            self.client = N9020AClient(N9020AConfig(resource=addr, remote_csv_path=remote_csv_path))
             self.client.connect()
             self.connected = True
             self.connect_btn.setText("断开仪表")
@@ -156,6 +171,42 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.client = None
             QMessageBox.critical(self, "连接失败", str(exc))
+
+    def _open_folder(self) -> None:
+        folder_text = self.folder_edit.text().strip()
+        if not folder_text:
+            QMessageBox.warning(self, "提示", "请先选择存储文件夹")
+            return
+        folder = Path(folder_text)
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
+
+    def _clear_folder(self) -> None:
+        folder_text = self.folder_edit.text().strip()
+        if not folder_text:
+            QMessageBox.warning(self, "提示", "请先选择存储文件夹")
+            return
+        folder = Path(folder_text)
+        if not folder.exists():
+            QMessageBox.information(self, "提示", "文件夹不存在，无需清空")
+            return
+        reply = QMessageBox.question(
+            self,
+            "确认清空",
+            f"确认删除 {folder} 下所有内容吗？",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        for item in folder.iterdir():
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+        self.state.current_index = 1
+        self._save_state()
+        self._refresh_progress()
 
     def _disconnect(self) -> None:
         self._stop_collect()

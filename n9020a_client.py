@@ -7,6 +7,7 @@ from dataclasses import dataclass
 class N9020AConfig:
     resource: str
     timeout_ms: int = 5000
+    remote_csv_path: str = r"D:\\data.csv"
 
 
 class N9020AClient:
@@ -56,7 +57,7 @@ class N9020AClient:
         if self._inst is None:
             raise RuntimeError("Instrument not connected")
 
-        remote_path = r'C:\data.csv'
+        remote_path = self.config.remote_csv_path
         self.write(":INIT:CONT OFF")
         self.write(":INIT:IMM")
         self.write(f'MMEM:STOR:TRAC:DATA TRAC1, "{remote_path}"')
