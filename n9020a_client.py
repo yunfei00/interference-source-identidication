@@ -65,6 +65,9 @@ class N9020AClient:
         if not raw:
             raise RuntimeError("Empty data returned from instrument")
 
+        # Readback succeeded; delete temporary file on the instrument.
+        self.write(f'MMEM:DEL "{remote_path}"')
+
         # The returned payload may already be CSV text; normalize line endings.
         csv_text = raw.replace("\r\n", "\n").strip()
         return csv_text
