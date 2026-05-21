@@ -60,7 +60,7 @@ class N9020AClient:
         remote_path = self.config.remote_csv_path
         self.write(":INIT:CONT OFF")
         self.write(":INIT:IMM")
-        self.write(f'MMEM:STOR:TRAC:DATA TRAC1, "{remote_path}"')
+        self.write(f'MMEM:STOR:TRAC:DATA TRACE1, "{remote_path}"')
         raw = self.query(f':MMEM:DATA? "{remote_path}"')
         if not raw:
             raise RuntimeError("Empty data returned from instrument")
