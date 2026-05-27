@@ -43,6 +43,7 @@ class CollectorState:
     td_start_mhz: float = 600.0
     td_step_mhz: float = 5.0
     td_stop_mhz: float = 700.0
+    td_current_freq_mhz: float = 600.0
 
 
 class MainWindow(QMainWindow):
@@ -132,6 +133,7 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("状态：未连接")
         self.progress_label = QLabel("进度：0 / 0")
         self.next_file_label = QLabel("下一个文件：000001.csv")
+        self.current_freq_label = QLabel("当前频率：--")
         self.status_label.setAlignment(Qt.AlignLeft)
 
         layout = QVBoxLayout(central)
@@ -140,6 +142,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.status_label)
         layout.addWidget(self.progress_label)
         layout.addWidget(self.next_file_label)
+        layout.addWidget(self.current_freq_label)
 
     def _load_state(self) -> CollectorState:
         if STATE_FILE.exists():
@@ -266,6 +269,7 @@ class MainWindow(QMainWindow):
             return
         if self.time_domain_check.isChecked():
             self.state.current_index = 1
+            self.state.td_current_freq_mhz = self.td_start_spin.value()
             self._save_state()
             return
         max_idx = 0
@@ -279,13 +283,17 @@ class MainWindow(QMainWindow):
         self._save_state()
 
     def _refresh_progress(self) -> None:
-        current = max(self.state.current_index - 1, 0)
         total = self.total_spin.value()
-        self.progress_label.setText(f"进度：{current} / {total}")
         if self.time_domain_check.isChecked():
-            self.next_file_label.setText("下一个文件：按频率目录/000001.csv")
+            current = max(self.state.current_index - 1, 0)
+            self.progress_label.setText(f"当前频点进度：{current} / {total}")
+            self.next_file_label.setText(f"下一个文件：按频率目录/{self.state.current_index:06d}.csv")
+            self.current_freq_label.setText(f"当前频率：{self.state.td_current_freq_mhz:.3f} MHz")
         else:
+            current = max(self.state.current_index - 1, 0)
+            self.progress_label.setText(f"进度：{current} / {total}")
             self.next_file_label.setText(f"下一个文件：{self.state.current_index:06d}.csv")
+            self.current_freq_label.setText("当前频率：--")
 
     def _start_collect(self) -> None:
         if not self.connected or self.client is None:
@@ -303,6 +311,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "提示", "时域起始频率不能大于终止频率")
                 return
             self.state.current_index = 1
+            self.state.td_current_freq_mhz = self.td_start_spin.value()
             self._save_state()
         else:
             self._sync_index_with_folder()
@@ -331,7 +340,7 @@ class MainWindow(QMainWindow):
         if not self.running or self.client is None:
             return
 
-        if self.state.current_index > self.total_spin.value():
+        if (not self.time_domain_check.isChecked()) and self.state.current_index > self.total_spin.value():
             self._stop_collect()
             QMessageBox.information(self, "完成", "采集任务完成")
             return
@@ -339,37 +348,49 @@ class MainWindow(QMainWindow):
         try:
             folder = Path(self.folder_edit.text().strip())
             if self.time_domain_check.isChecked():
-                self._collect_time_domain_once(folder)
+                finished = self._collect_time_domain_once(folder)
+                if finished:
+                    self._stop_collect()
+                    QMessageBox.information(self, "完成", "时域采集任务完成")
+                    return
             else:
                 csv_text = self.client.fetch_csv_text()
                 filename = folder / f"{self.state.current_index:06d}.csv"
                 header = f"timestamp,{datetime.now().isoformat()}\n"
                 filename.write_text(header + csv_text + "\n", encoding="utf-8")
-            self.state.current_index += 1
+                self.state.current_index += 1
             self._save_state()
             self._refresh_progress()
         except Exception as exc:
             self._stop_collect()
             QMessageBox.critical(self, "采集失败", str(exc))
 
-    def _collect_time_domain_once(self, root_folder: Path) -> None:
+    def _collect_time_domain_once(self, root_folder: Path) -> bool:
         if self.client is None:
             raise RuntimeError("Instrument not connected")
 
-        start = self.td_start_spin.value()
         step = self.td_step_spin.value()
         stop = self.td_stop_spin.value()
+        freq = self.state.td_current_freq_mhz
 
-        freq = start
-        while freq <= stop + 1e-9:
-            self.client.set_center_and_span_mhz(freq, 0.0)
-            csv_text = self.client.fetch_csv_text()
-            freq_folder = root_folder / f"{freq:.3f}MHz"
-            freq_folder.mkdir(parents=True, exist_ok=True)
-            filename = freq_folder / f"{self.state.current_index:06d}.csv"
-            header = f"timestamp,{datetime.now().isoformat()}\nfrequency_mhz,{freq:.6f}\n"
-            filename.write_text(header + csv_text + "\n", encoding="utf-8")
-            freq += step
+        if freq > stop + 1e-9:
+            return True
+
+        self.client.set_center_and_span_mhz(freq, 0.0)
+        csv_text = self.client.fetch_csv_text()
+        freq_folder = root_folder / f"{freq:.3f}MHz"
+        freq_folder.mkdir(parents=True, exist_ok=True)
+        filename = freq_folder / f"{self.state.current_index:06d}.csv"
+        header = f"timestamp,{datetime.now().isoformat()}\nfrequency_mhz,{freq:.6f}\n"
+        filename.write_text(header + csv_text + "\n", encoding="utf-8")
+
+        if self.state.current_index >= self.total_spin.value():
+            self.state.current_index = 1
+            self.state.td_current_freq_mhz = freq + step
+        else:
+            self.state.current_index += 1
+
+        return self.state.td_current_freq_mhz > stop + 1e-9 and self.state.current_index == 1
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._save_state()
