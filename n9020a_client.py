@@ -71,3 +71,9 @@ class N9020AClient:
         # The returned payload may already be CSV text; normalize line endings.
         csv_text = raw.replace("\r\n", "\n").strip()
         return csv_text
+
+    def set_center_and_span_mhz(self, center_mhz: float, span_mhz: float) -> None:
+        if self._inst is None:
+            raise RuntimeError("Instrument not connected")
+        self.write(f":FREQ:CENT {center_mhz} MHz")
+        self.write(f":FREQ:SPAN {span_mhz} MHz")
