@@ -22,18 +22,30 @@ class N9020AClient:
         import pyvisa
 
         self._rm = pyvisa.ResourceManager()
-        self._inst = self._rm.open_resource(self.config.resource)
-        self._inst.timeout = self.config.timeout_ms
-        # Optional sanity check
-        _ = self.query("*IDN?")
+        try:
+            self._inst = self._rm.open_resource(self.config.resource)
+            self._inst.timeout = self.config.timeout_ms
+            # Optional sanity check
+            _ = self.query("*IDN?")
+        except Exception:
+            self.disconnect()
+            raise
 
     def disconnect(self) -> None:
         if self._inst is not None:
-            self._inst.close()
-            self._inst = None
+            try:
+                self._inst.close()
+            except Exception:
+                pass
+            finally:
+                self._inst = None
         if self._rm is not None:
-            self._rm.close()
-            self._rm = None
+            try:
+                self._rm.close()
+            except Exception:
+                pass
+            finally:
+                self._rm = None
 
     def write(self, cmd: str) -> None:
         if self._inst is None:
@@ -51,8 +63,9 @@ class N9020AClient:
         SCPI sequence:
         1) Disable continuous scan.
         2) Trigger one immediate scan.
-        3) Store trace data to instrument file.
-        4) Read file back via MMEM:DATA?.
+        3) Wait for the scan to complete.
+        4) Store trace data to instrument file.
+        5) Read file back via MMEM:DATA?.
         """
         if self._inst is None:
             raise RuntimeError("Instrument not connected")
@@ -60,6 +73,9 @@ class N9020AClient:
         remote_path = self.config.remote_csv_path
         self.write(":INIT:CONT OFF")
         self.write(":INIT:IMM")
+        # Kept as one isolated compatibility change: remove this query if a
+        # particular firmware does not support operation-complete polling.
+        self.query("*OPC?")
         self.write(f'MMEM:STOR:TRAC:DATA TRACE1, "{remote_path}"')
         raw = self.query(f':MMEM:DATA? "{remote_path}"')
         if not raw:
