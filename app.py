@@ -24,17 +24,18 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressBar,
+    QRadioButton,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 from acquisition_worker import AcquisitionWorker, CaptureRequest
+from data_export import ExportOptions
+from data_export_worker import DataExportWorker
 from file_pairing import is_capture_complete, next_capture_index
-from image_conversion_worker import ImageConversionWorker
 from n9020a_client import N9020AClient, N9020AConfig
 from sds3104xhd_client import SDS3104XHDClient, SDS3104XHDConfig
-from data_visualizer import default_output_directory
 from time_formatting import format_time_value
 
 STATE_FILE = Path("collector_state.json")
@@ -78,7 +79,7 @@ class MainWindow(QMainWindow):
         self._worker_had_error = False
         self._capture_completed_task = False
         self._conversion_thread: QThread | None = None
-        self._conversion_worker: ImageConversionWorker | None = None
+        self._conversion_worker: DataExportWorker | None = None
 
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
@@ -205,40 +206,63 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._build_conversion_group())
 
     def _build_conversion_group(self) -> QGroupBox:
-        group = QGroupBox("数据转图片")
+        group = QGroupBox("数据导出与分析")
         form = QFormLayout(group)
 
         source_row = QHBoxLayout()
         self.conversion_source_edit = QLineEdit()
         self.conversion_source_edit.setReadOnly(True)
-        self.conversion_file_btn = QPushButton("选择文件...")
-        self.conversion_file_btn.clicked.connect(self._choose_conversion_file)
-        self.conversion_folder_btn = QPushButton("选择目录...")
+        self.conversion_folder_btn = QPushButton("选择...")
         self.conversion_folder_btn.clicked.connect(self._choose_conversion_directory)
         source_row.addWidget(self.conversion_source_edit)
-        source_row.addWidget(self.conversion_file_btn)
         source_row.addWidget(self.conversion_folder_btn)
-        form.addRow("数据源", source_row)
+        form.addRow("数据目录", source_row)
 
         output_row = QHBoxLayout()
         self.conversion_output_edit = QLineEdit()
         self.conversion_output_btn = QPushButton("选择...")
         self.conversion_output_btn.clicked.connect(self._choose_conversion_output)
-        self.open_images_btn = QPushButton("打开图片目录")
+        self.open_images_btn = QPushButton("打开输出目录")
         self.open_images_btn.clicked.connect(self._open_images_directory)
         output_row.addWidget(self.conversion_output_edit)
         output_row.addWidget(self.conversion_output_btn)
         output_row.addWidget(self.open_images_btn)
         form.addRow("输出目录", output_row)
 
-        self.conversion_overwrite_check = QCheckBox("覆盖已有图片")
+        range_row = QHBoxLayout()
+        self.export_all_frequencies_radio = QRadioButton("全部频点")
+        self.export_current_directory_radio = QRadioButton("当前目录")
+        self.export_all_frequencies_radio.setChecked(True)
+        range_row.addWidget(self.export_all_frequencies_radio)
+        range_row.addWidget(self.export_current_directory_radio)
+        range_row.addStretch()
+        form.addRow("数据范围", range_row)
+
+        output_options = QVBoxLayout()
+        self.export_scope_csv_check = QCheckBox("示波器 NPZ → CSV")
+        self.export_n9020a_png_check = QCheckBox("N9020A CSV → PNG")
+        self.export_scope_png_check = QCheckBox("示波器 NPZ → PNG")
+        self.export_summary_check = QCheckBox("正脉宽汇总 CSV")
+        self.export_html_check = QCheckBox("正脉宽 HTML 分析报告")
+        for checkbox in (
+            self.export_scope_csv_check,
+            self.export_n9020a_png_check,
+            self.export_scope_png_check,
+            self.export_summary_check,
+            self.export_html_check,
+        ):
+            checkbox.toggled.connect(self._update_conversion_controls)
+            output_options.addWidget(checkbox)
+        form.addRow("输出内容", output_options)
+
+        self.conversion_overwrite_check = QCheckBox("覆盖已有输出")
         self.conversion_overwrite_check.setChecked(False)
-        form.addRow("转换选项", self.conversion_overwrite_check)
+        form.addRow("处理选项", self.conversion_overwrite_check)
 
         button_row = QHBoxLayout()
-        self.conversion_start_btn = QPushButton("开始转换")
+        self.conversion_start_btn = QPushButton("开始处理")
         self.conversion_start_btn.clicked.connect(self._start_image_conversion)
-        self.conversion_stop_btn = QPushButton("停止转换")
+        self.conversion_stop_btn = QPushButton("停止")
         self.conversion_stop_btn.clicked.connect(self._stop_image_conversion)
         self.conversion_stop_btn.setEnabled(False)
         button_row.addWidget(self.conversion_start_btn)
@@ -408,30 +432,20 @@ class MainWindow(QMainWindow):
         folder.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
 
-    def _choose_conversion_file(self) -> None:
-        filename, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择 CSV 或 NPZ 数据文件",
-            "",
-            "数据文件 (*.csv *.npz)",
-        )
-        if filename:
-            self._set_conversion_source(Path(filename))
-
     def _choose_conversion_directory(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "选择数据目录")
+        folder = QFileDialog.getExistingDirectory(self, "选择原始数据根目录")
         if folder:
             self._set_conversion_source(Path(folder))
 
     def _set_conversion_source(self, source: Path) -> None:
         self.conversion_source_edit.setText(str(source))
-        self.conversion_output_edit.setText(str(default_output_directory(source)))
+        self.conversion_output_edit.setText(str(source / "export"))
         self.conversion_status_label.setText("状态：已选择数据源")
         self._update_conversion_controls()
 
     def _choose_conversion_output(self) -> None:
         initial = self.conversion_output_edit.text().strip()
-        folder = QFileDialog.getExistingDirectory(self, "选择图片输出目录", initial)
+        folder = QFileDialog.getExistingDirectory(self, "选择导出输出目录", initial)
         if folder:
             self.conversion_output_edit.setText(folder)
             self._update_conversion_controls()
@@ -439,7 +453,7 @@ class MainWindow(QMainWindow):
     def _open_images_directory(self) -> None:
         output_text = self.conversion_output_edit.text().strip()
         if not output_text:
-            QMessageBox.warning(self, "提示", "请先选择图片输出目录")
+            QMessageBox.warning(self, "提示", "请先选择导出输出目录")
             return
         output = Path(output_text)
         output.mkdir(parents=True, exist_ok=True)
@@ -450,21 +464,34 @@ class MainWindow(QMainWindow):
             return
         source_text = self.conversion_source_edit.text().strip()
         if not source_text:
-            QMessageBox.warning(self, "提示", "请先选择 CSV、NPZ 或数据目录")
+            QMessageBox.warning(self, "提示", "请先选择原始数据根目录")
             return
         source = Path(source_text)
-        if not source.exists():
-            QMessageBox.warning(self, "提示", f"数据源不存在：{source}")
+        if not source.is_dir():
+            QMessageBox.warning(self, "提示", f"数据目录不存在：{source}")
             return
         output_text = self.conversion_output_edit.text().strip()
-        output = Path(output_text) if output_text else default_output_directory(source)
+        output = Path(output_text) if output_text else source / "export"
         self.conversion_output_edit.setText(str(output))
 
+        options = ExportOptions(
+            scope_csv=self.export_scope_csv_check.isChecked(),
+            n9020a_png=self.export_n9020a_png_check.isChecked(),
+            scope_png=self.export_scope_png_check.isChecked(),
+            pulse_width_summary=self.export_summary_check.isChecked(),
+            html_report=self.export_html_check.isChecked(),
+            overwrite=self.conversion_overwrite_check.isChecked(),
+            all_frequencies=self.export_all_frequencies_radio.isChecked(),
+        )
+        if not options.has_output():
+            QMessageBox.warning(self, "提示", "请至少选择一种输出内容")
+            return
+
         thread = QThread(self)
-        worker = ImageConversionWorker(
+        worker = DataExportWorker(
             source,
             output,
-            self.conversion_overwrite_check.isChecked(),
+            options,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -487,7 +514,7 @@ class MainWindow(QMainWindow):
         self.conversion_progress_bar.setFormat("0.0%")
         self.conversion_progress_label.setText("当前：0 / 0")
         self.conversion_counts_label.setText("成功：0  跳过：0  失败：0")
-        self.conversion_status_label.setText("状态：正在扫描数据文件")
+        self.conversion_status_label.setText("状态：正在扫描频点与样本")
         self._conversion_success = 0
         self._conversion_skipped = 0
         self._conversion_failed = 0
@@ -498,7 +525,7 @@ class MainWindow(QMainWindow):
         if self._conversion_worker is not None:
             self._conversion_worker.request_stop()
             self.conversion_stop_btn.setEnabled(False)
-            self.conversion_status_label.setText("状态：将在当前文件转换完成后停止")
+            self.conversion_status_label.setText("状态：将在当前文件处理完成后停止")
 
     def _on_conversion_progress(self, current: int, total: int) -> None:
         percentage = current / total * 100.0 if total else 0.0
@@ -506,8 +533,8 @@ class MainWindow(QMainWindow):
         self.conversion_progress_bar.setFormat(f"{percentage:.1f}%")
         self.conversion_progress_label.setText(f"当前：{current} / {total}")
 
-    def _on_conversion_current_file(self, filename: str) -> None:
-        self.conversion_status_label.setText(f"状态：正在转换 {Path(filename).name}")
+    def _on_conversion_current_file(self, label: str) -> None:
+        self.conversion_status_label.setText(f"状态：正在处理 {label}")
 
     def _on_conversion_success_count(self, count: int) -> None:
         self._conversion_success = count
@@ -531,7 +558,7 @@ class MainWindow(QMainWindow):
         logger.info(message)
 
     def _on_conversion_error(self, message: str) -> None:
-        logger.warning("Image conversion: %s", message)
+        logger.warning("Data export: %s", message)
 
     def _on_conversion_finished(self, summary: dict) -> None:
         self._conversion_success = int(summary.get("success", 0))
@@ -542,9 +569,9 @@ class MainWindow(QMainWindow):
         if summary.get("stopped"):
             prefix = "已停止"
         elif self._conversion_failed:
-            prefix = "转换完成（有失败）"
+            prefix = "处理完成（有失败）"
         else:
-            prefix = "转换完成"
+            prefix = "处理完成"
         self.conversion_status_label.setText(
             f"状态：{prefix}；Total: {total}, Success: {self._conversion_success}, "
             f"Skipped: {self._conversion_skipped}, Failed: {self._conversion_failed}"
@@ -765,11 +792,12 @@ class MainWindow(QMainWindow):
         if scope_stats:
             self.scope_status_label.setText(
                 f"Scope：{self.scope_idn}\n"
-                f"{scope_stats['point_count']:,} pts\n"
-                f"{scope_stats['min_voltage']:.3f} ~ {scope_stats['max_voltage']:.3f} V\n"
-                f"正脉宽：{format_time_value(scope_stats['positive_pulse_width_s'])}\n"
-                f"read {scope_stats['read_seconds']:.2f} s, "
-                f"save {scope_stats['save_seconds']:.2f} s"
+                f"Points: {scope_stats['point_count']:,}\n"
+                f"Voltage: {scope_stats['min_voltage']:.3f} ~ "
+                f"{scope_stats['max_voltage']:.3f} V\n"
+                f"PWID: {format_time_value(scope_stats['positive_pulse_width_s'])}\n"
+                f"Read: {scope_stats['read_seconds']:.2f} s\n"
+                f"Save: {scope_stats['save_seconds']:.2f} s"
             )
 
         self._save_state()
@@ -840,15 +868,34 @@ class MainWindow(QMainWindow):
         self.td_step_spin.setEnabled(zero_span_controls_enabled)
         self.td_stop_spin.setEnabled(zero_span_controls_enabled)
 
-    def _update_conversion_controls(self) -> None:
+    def _update_conversion_controls(self, *_args) -> None:
         busy = self._conversion_thread is not None
         has_source = bool(self.conversion_source_edit.text().strip())
-        self.conversion_file_btn.setEnabled(not busy)
+        has_output = any(
+            checkbox.isChecked()
+            for checkbox in (
+                self.export_scope_csv_check,
+                self.export_n9020a_png_check,
+                self.export_scope_png_check,
+                self.export_summary_check,
+                self.export_html_check,
+            )
+        )
         self.conversion_folder_btn.setEnabled(not busy)
         self.conversion_output_edit.setEnabled(not busy)
         self.conversion_output_btn.setEnabled(not busy)
         self.conversion_overwrite_check.setEnabled(not busy)
-        self.conversion_start_btn.setEnabled(not busy and has_source)
+        self.export_all_frequencies_radio.setEnabled(not busy)
+        self.export_current_directory_radio.setEnabled(not busy)
+        for checkbox in (
+            self.export_scope_csv_check,
+            self.export_n9020a_png_check,
+            self.export_scope_png_check,
+            self.export_summary_check,
+            self.export_html_check,
+        ):
+            checkbox.setEnabled(not busy)
+        self.conversion_start_btn.setEnabled(not busy and has_source and has_output)
         self.conversion_stop_btn.setEnabled(busy)
         self.open_images_btn.setEnabled(bool(self.conversion_output_edit.text().strip()))
 

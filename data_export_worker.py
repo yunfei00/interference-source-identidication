@@ -5,11 +5,11 @@ from threading import Event
 
 from PySide6.QtCore import QObject, Signal, Slot
 
-from data_visualizer import ConversionTask, batch_convert
+from data_export import ExportOptions, run_data_export
 
 
-class ImageConversionWorker(QObject):
-    """Convert data files in a background thread, stopping between files."""
+class DataExportWorker(QObject):
+    """Run offline export and analysis without blocking the GUI thread."""
 
     progress = Signal(int, int)
     current_file = Signal(str)
@@ -20,11 +20,16 @@ class ImageConversionWorker(QObject):
     log = Signal(str)
     finished = Signal(dict)
 
-    def __init__(self, source: Path, output_directory: Path, overwrite: bool) -> None:
+    def __init__(
+        self,
+        data_root: Path,
+        output_root: Path,
+        options: ExportOptions,
+    ) -> None:
         super().__init__()
-        self.source = source
-        self.output_directory = output_directory
-        self.overwrite = overwrite
+        self.data_root = data_root
+        self.output_root = output_root
+        self.options = options
         self._stop_requested = Event()
 
     def request_stop(self) -> None:
@@ -34,24 +39,24 @@ class ImageConversionWorker(QObject):
     def run(self) -> None:
         counts = {"success": 0, "skipped": 0, "failed": 0}
 
-        def on_start(position: int, total: int, task: ConversionTask) -> None:
-            self.current_file.emit(str(task.source))
-            self.log.emit(f"[{position}/{total}] converting {task.source}")
+        def on_start(position: int, total: int, label: str) -> None:
+            self.current_file.emit(label)
+            self.log.emit(f"[{position}/{total}] processing {label}")
 
         def on_result(
             position: int,
             total: int,
-            task: ConversionTask,
+            label: str,
             status: str,
             message: str,
         ) -> None:
             counts[status] += 1
             if status == "success":
-                self.log.emit(f"[{position}/{total}] {task.source.name} OK")
+                self.log.emit(f"[{position}/{total}] {label} OK")
             elif status == "skipped":
-                self.log.emit(f"[{position}/{total}] {task.source.name} SKIPPED")
+                self.log.emit(f"[{position}/{total}] {label} SKIPPED")
             else:
-                detail = f"[{position}/{total}] {task.source.name} FAILED: {message}"
+                detail = f"[{position}/{total}] {label} FAILED: {message}"
                 self.log.emit(detail)
                 self.error.emit(detail)
             self.success_count.emit(counts["success"])
@@ -60,10 +65,10 @@ class ImageConversionWorker(QObject):
             self.progress.emit(position, total)
 
         try:
-            summary = batch_convert(
-                self.source,
-                self.output_directory,
-                overwrite=self.overwrite,
+            summary = run_data_export(
+                self.data_root,
+                self.output_root,
+                self.options,
                 should_stop=self._stop_requested.is_set,
                 on_start=on_start,
                 on_result=on_result,

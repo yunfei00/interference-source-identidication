@@ -3,3 +3,4 @@ pyvisa>=1.14.0
 pyvisa-py>=0.7.0
 numpy>=1.26
 matplotlib>=3.8
+plotly>=5.24

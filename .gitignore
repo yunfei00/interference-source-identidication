@@ -221,5 +221,12 @@ __marimo__/
 collector_state.json
 *.npz
 *.png
+*.jpg
+*.jpeg
+*.html
+*.csv
+!tests/fixtures/
+!tests/fixtures/**/*.csv
+export/
 *.csv.tmp
 *.npz.tmp

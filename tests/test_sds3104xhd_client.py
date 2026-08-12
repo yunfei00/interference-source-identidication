@@ -136,6 +136,8 @@ def test_positive_pulse_width_unavailable_logs_warning(monkeypatch, caplog) -> N
 def test_time_value_formatting() -> None:
     assert format_time_value(1.3447e-7) == "134.47 ns"
     assert format_time_value(2.53e-6) == "2.53 μs"
+    assert format_time_value(2.3e-6) == "2.30 μs"
+    assert format_time_value(0.0012) == "1.20 ms"
     assert format_time_value(float("nan")) == "N/A"
 
 
