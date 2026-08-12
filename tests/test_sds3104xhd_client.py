@@ -13,8 +13,10 @@ from sds3104xhd_client import (
     convert_adc_to_voltage,
     decode_word_data,
     parse_ieee4882_binary_block,
+    parse_positive_pulse_width,
     parse_preamble,
 )
+from time_formatting import format_time_value
 
 
 def _make_preamble() -> bytes:
@@ -79,6 +81,64 @@ def test_voltage_conversion_matches_verified_scope_value() -> None:
     assert float(voltage[0]) == pytest.approx(2.995294, abs=1e-6)
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("1.3447E-07", 1.3447e-07),
+        ("****", None),
+        ("", None),
+        ("---", None),
+        ("not-a-number", None),
+    ],
+)
+def test_positive_pulse_width_parser(raw: str, expected: float | None) -> None:
+    result = parse_positive_pulse_width(raw)
+    if expected is None:
+        assert np.isnan(result)
+    else:
+        assert result == pytest.approx(expected)
+
+
+def test_positive_pulse_width_configuration_command(monkeypatch) -> None:
+    client = SDS3104XHDClient(SDS3104XHDConfig())
+    commands: list[str] = []
+    monkeypatch.setattr(client, "write", commands.append)
+
+    client.configure_positive_pulse_width()
+
+    assert commands == ["MEAS:ADV:P1:TYPE PWID"]
+
+
+def test_positive_pulse_width_read_uses_advanced_p1_query(monkeypatch) -> None:
+    client = SDS3104XHDClient(SDS3104XHDConfig())
+    queries: list[str] = []
+
+    def query(command: str) -> str:
+        queries.append(command)
+        return "1.3447E-07"
+
+    monkeypatch.setattr(client, "query", query)
+    assert client.read_positive_pulse_width(25) == pytest.approx(1.3447e-07)
+    assert queries == ["MEAS:ADV:P1:VAL?"]
+
+
+def test_positive_pulse_width_unavailable_logs_warning(monkeypatch, caplog) -> None:
+    client = SDS3104XHDClient(SDS3104XHDConfig())
+    monkeypatch.setattr(client, "query", lambda _command: "****")
+
+    with caplog.at_level("WARNING"):
+        value = client.read_positive_pulse_width(25)
+
+    assert np.isnan(value)
+    assert "[000025] PWID unavailable: ****" in caplog.text
+
+
+def test_time_value_formatting() -> None:
+    assert format_time_value(1.3447e-7) == "134.47 ns"
+    assert format_time_value(2.53e-6) == "2.53 μs"
+    assert format_time_value(float("nan")) == "N/A"
+
+
 def test_npz_save_keeps_tmp_name_and_required_dtypes(tmp_path) -> None:
     preamble = parse_preamble(_make_preamble())
     adc = np.asarray([-2, 0, 2], dtype=np.int16)
@@ -91,7 +151,7 @@ def test_npz_save_keeps_tmp_name_and_required_dtypes(tmp_path) -> None:
     client = SDS3104XHDClient(SDS3104XHDConfig())
     output = tmp_path / "000001.npz.tmp"
 
-    client.save_npz(output, waveform, index=1)
+    client.save_npz(output, waveform, index=1, positive_pulse_width_s=1.3447e-7)
 
     assert output.is_file()
     assert not (tmp_path / "000001.npz.tmp.npz").exists()
@@ -100,5 +160,7 @@ def test_npz_save_keeps_tmp_name_and_required_dtypes(tmp_path) -> None:
         assert saved["time_s"].dtype == np.dtype("float64")
         assert saved["voltage_v"].dtype == np.dtype("float32")
         assert saved["adc"].dtype == np.dtype("int16")
+        assert saved["positive_pulse_width_s"].dtype == np.dtype("float64")
+        assert float(saved["positive_pulse_width_s"]) == pytest.approx(1.3447e-7)
         assert int(saved["point_count"]) == 3
         assert str(saved["channel"]) == "C1"

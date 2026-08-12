@@ -71,7 +71,16 @@ class _FakeScope:
     def read_waveform(self) -> _FakeWaveform:
         return _FakeWaveform()
 
-    def save_npz(self, path: Path, _waveform: _FakeWaveform, _index: int) -> None:
+    def read_positive_pulse_width(self, _index: int) -> float:
+        return 1.25e-7
+
+    def save_npz(
+        self,
+        path: Path,
+        _waveform: _FakeWaveform,
+        _index: int,
+        _positive_pulse_width_s: float,
+    ) -> None:
         path.write_bytes(b"npz")
         if self.fail_save:
             raise OSError("simulated NPZ save error")
@@ -107,3 +116,64 @@ def test_worker_save_failure_cleans_tmp_and_formal_files(tmp_path: Path) -> None
     assert errors and "simulated NPZ save error" in errors[0]
     assert list(tmp_path.iterdir()) == []
     assert next_capture_index(tmp_path, scope_enabled=True) == 1
+
+
+def test_worker_reads_pwid_after_single_and_before_waveform(tmp_path: Path) -> None:
+    events: list[str] = []
+
+    class OrderedN9020A(_FakeN9020A):
+        def fetch_csv_text(self) -> str:
+            events.append("n9020a_csv")
+            return super().fetch_csv_text()
+
+    class OrderedScope(_FakeScope):
+        def acquire_single(self) -> float:
+            events.append("single")
+            return super().acquire_single()
+
+        def read_positive_pulse_width(self, index: int) -> float:
+            events.append("pwid")
+            return super().read_positive_pulse_width(index)
+
+        def read_waveform(self) -> _FakeWaveform:
+            events.append("waveform")
+            return super().read_waveform()
+
+        def save_npz(
+            self,
+            path: Path,
+            waveform: _FakeWaveform,
+            index: int,
+            pulse_width: float,
+        ) -> None:
+            events.append("save_npz")
+            super().save_npz(path, waveform, index, pulse_width)
+
+    worker = AcquisitionWorker(
+        OrderedN9020A(),
+        OrderedScope(),
+        CaptureRequest(tmp_path, index=1, scope_enabled=True),
+    )  # type: ignore[arg-type]
+
+    worker.capture_one()
+
+    assert events == ["single", "pwid", "n9020a_csv", "waveform", "save_npz"]
+
+
+def test_unavailable_pwid_does_not_fail_capture_pair(tmp_path: Path) -> None:
+    class UnavailablePWIDScope(_FakeScope):
+        def read_positive_pulse_width(self, _index: int) -> float:
+            return float("nan")
+
+    worker = AcquisitionWorker(
+        _FakeN9020A(),
+        UnavailablePWIDScope(),
+        CaptureRequest(tmp_path, index=1, scope_enabled=True),
+    )  # type: ignore[arg-type]
+    errors: list[str] = []
+    worker.error.connect(errors.append)
+
+    worker.capture_one()
+
+    assert not errors
+    assert is_capture_complete(tmp_path, 1, scope_enabled=True)

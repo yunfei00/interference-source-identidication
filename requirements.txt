@@ -2,3 +2,4 @@ PySide6>=6.7.0
 pyvisa>=1.14.0
 pyvisa-py>=0.7.0
 numpy>=1.26
+matplotlib>=3.8

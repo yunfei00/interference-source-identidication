@@ -63,6 +63,9 @@ class AcquisitionWorker(QObject):
                 remove_incomplete_pair(folder, self.request.index)
 
                 single_seconds = self.scope_client.acquire_single()
+                positive_pulse_width_s = self.scope_client.read_positive_pulse_width(
+                    self.request.index
+                )
                 csv_text = self.n9020a_client.fetch_csv_text()
                 read_started = time.monotonic()
                 waveform = self.scope_client.read_waveform()
@@ -70,7 +73,12 @@ class AcquisitionWorker(QObject):
 
                 self._write_csv_tmp(csv_tmp, csv_text)
                 save_started = time.monotonic()
-                self.scope_client.save_npz(npz_tmp, waveform, self.request.index)
+                self.scope_client.save_npz(
+                    npz_tmp,
+                    waveform,
+                    self.request.index,
+                    positive_pulse_width_s,
+                )
                 save_seconds = time.monotonic() - save_started
                 self._commit_pair(csv_tmp, npz_tmp, csv_path, npz_path)
 
@@ -87,6 +95,7 @@ class AcquisitionWorker(QObject):
                             "single_seconds": single_seconds,
                             "read_seconds": read_seconds,
                             "save_seconds": save_seconds,
+                            "positive_pulse_width_s": positive_pulse_width_s,
                         },
                     }
                 )

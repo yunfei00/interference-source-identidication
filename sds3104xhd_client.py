@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import math
 import struct
 import time
 import warnings
@@ -54,6 +56,8 @@ TDIV_ENUM = (
 HORI_NUM = 10
 PREAMBLE_MIN_BYTES = 346
 BYTES_PER_POINT = 2
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -201,6 +205,20 @@ def convert_adc_to_voltage(
     )
 
 
+def parse_positive_pulse_width(raw: object) -> float:
+    """Parse a PWID response, returning NaN for unavailable measurements."""
+    if raw is None:
+        return float("nan")
+    text = str(raw).strip()
+    if not text or "*" in text or text == "---":
+        return float("nan")
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return float("nan")
+    return value if math.isfinite(value) else float("nan")
+
+
 class SDS3104XHDClient:
     """PyVISA driver for single-shot SDS3104X HD waveform capture."""
 
@@ -223,6 +241,7 @@ class SDS3104XHDClient:
             self._inst.timeout = self.config.timeout_ms
             self._inst.chunk_size = self.config.chunk_size
             self._idn = self.identify()
+            self.configure_positive_pulse_width()
         except Exception:
             self.disconnect()
             raise
@@ -246,6 +265,24 @@ class SDS3104XHDClient:
 
     def identify(self) -> str:
         return self.query("*IDN?")
+
+    def configure_positive_pulse_width(self) -> None:
+        """Configure advanced measurement P1 as positive pulse width."""
+        self.write("MEAS:ADV:P1:TYPE PWID")
+
+    def read_positive_pulse_width(self, capture_index: int | None = None) -> float:
+        """Read P1 in seconds without failing a capture when PWID is unavailable."""
+        prefix = f"[{capture_index:06d}] " if capture_index is not None else ""
+        try:
+            raw = self.query("MEAS:ADV:P1:VAL?").strip()
+        except Exception as exc:
+            logger.warning("%sPWID unavailable: query failed: %s", prefix, exc)
+            return float("nan")
+
+        value = parse_positive_pulse_width(raw)
+        if math.isnan(value):
+            logger.warning("%sPWID unavailable: %s", prefix, raw or "<empty>")
+        return value
 
     def write(self, command: str) -> None:
         if self._inst is None:
@@ -321,7 +358,13 @@ class SDS3104XHDClient:
         time_s = time_start + np.arange(adc.size, dtype=np.float64) * preamble.interval
         return ScopeWaveform(adc=adc, time_s=time_s, voltage_v=voltage_v, preamble=preamble)
 
-    def save_npz(self, path: str | Path, waveform: ScopeWaveform, index: int) -> None:
+    def save_npz(
+        self,
+        path: str | Path,
+        waveform: ScopeWaveform,
+        index: int,
+        positive_pulse_width_s: float = float("nan"),
+    ) -> None:
         output_path = Path(path)
         preamble = waveform.preamble
         sample_rate = 1.0 / preamble.interval
@@ -333,6 +376,7 @@ class SDS3104XHDClient:
                 time_s=waveform.time_s.astype(np.float64, copy=False),
                 voltage_v=waveform.voltage_v.astype(np.float32, copy=False),
                 adc=waveform.adc.astype(np.int16, copy=False),
+                positive_pulse_width_s=np.asarray(positive_pulse_width_s, dtype=np.float64),
                 device=np.asarray(device),
                 ip=np.asarray(self.config.ip),
                 channel=np.asarray(self.config.channel),

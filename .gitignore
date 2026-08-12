@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Runtime acquisition and visualization output
+collector_state.json
+*.npz
+*.png
+*.csv.tmp
+*.npz.tmp
