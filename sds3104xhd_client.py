@@ -7,8 +7,11 @@ import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
+
+from time_formatting import format_time_value
 
 
 TDIV_ENUM = (
@@ -56,6 +59,7 @@ TDIV_ENUM = (
 HORI_NUM = 10
 PREAMBLE_MIN_BYTES = 346
 BYTES_PER_POINT = 2
+PWID_SINGLE_MAX_ATTEMPTS = 5
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +111,19 @@ class ScopeWaveform:
     @property
     def point_count(self) -> int:
         return int(self.adc.size)
+
+
+@dataclass(frozen=True)
+class PulseWidthAcquisitionResult:
+    pulse_width_s: float
+    pulse_width_raw: str
+    pulse_width_valid: bool
+    attempts: int
+    single_seconds: float
+
+
+class AcquisitionStopped(RuntimeError):
+    """Raised at a safe checkpoint when the user stops an active capture."""
 
 
 def parse_ieee4882_binary_block(raw: bytes) -> bytes:
@@ -271,18 +288,74 @@ class SDS3104XHDClient:
         self.write("MEAS:ADV:P1:TYPE PWID")
 
     def read_positive_pulse_width(self, capture_index: int | None = None) -> float:
-        """Read P1 in seconds without failing a capture when PWID is unavailable."""
+        """Read P1 in seconds; invalid values become NaN and I/O errors propagate."""
         prefix = f"[{capture_index:06d}] " if capture_index is not None else ""
-        try:
-            raw = self.query("MEAS:ADV:P1:VAL?").strip()
-        except Exception as exc:
-            logger.warning("%sPWID unavailable: query failed: %s", prefix, exc)
-            return float("nan")
-
+        raw = self.query("MEAS:ADV:P1:VAL?").strip()
         value = parse_positive_pulse_width(raw)
         if math.isnan(value):
             logger.warning("%sPWID unavailable: %s", prefix, raw or "<empty>")
         return value
+
+    def acquire_single_with_pwid_retry(
+        self,
+        max_attempts: int = PWID_SINGLE_MAX_ATTEMPTS,
+        *,
+        capture_index: int | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> PulseWidthAcquisitionResult:
+        """Acquire fresh Single frames until PWID is valid or attempts are exhausted."""
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+
+        prefix = f"[{capture_index:06d}] " if capture_index is not None else ""
+        last_raw = ""
+        last_single_seconds = 0.0
+        for attempt in range(1, max_attempts + 1):
+            if should_stop is not None and should_stop():
+                raise AcquisitionStopped("Capture stopped before Scope Single")
+
+            logger.info(
+                "%sScope Single attempt %d/%d",
+                prefix,
+                attempt,
+                max_attempts,
+            )
+            last_single_seconds = self.acquire_single()
+
+            if should_stop is not None and should_stop():
+                raise AcquisitionStopped("Capture stopped after Scope Single")
+
+            # Query errors are communication failures and must follow the device error path.
+            last_raw = self.query("MEAS:ADV:P1:VAL?").strip()
+            pulse_width_s = parse_positive_pulse_width(last_raw)
+            if math.isfinite(pulse_width_s):
+                logger.info(
+                    "%sPWID = %s",
+                    prefix,
+                    format_time_value(pulse_width_s),
+                )
+                return PulseWidthAcquisitionResult(
+                    pulse_width_s=pulse_width_s,
+                    pulse_width_raw=last_raw,
+                    pulse_width_valid=True,
+                    attempts=attempt,
+                    single_seconds=last_single_seconds,
+                )
+
+            logger.warning("%sPWID unavailable: %s", prefix, last_raw or "<empty>")
+
+        logger.warning(
+            "%sPWID unavailable after %d Single attempts; using last acquisition",
+            prefix,
+            max_attempts,
+        )
+        return PulseWidthAcquisitionResult(
+            pulse_width_s=float("nan"),
+            pulse_width_raw=last_raw,
+            pulse_width_valid=False,
+            attempts=max_attempts,
+            single_seconds=last_single_seconds,
+        )
 
     def write(self, command: str) -> None:
         if self._inst is None:
@@ -364,11 +437,19 @@ class SDS3104XHDClient:
         waveform: ScopeWaveform,
         index: int,
         positive_pulse_width_s: float = float("nan"),
+        positive_pulse_width_raw: str = "",
+        positive_pulse_width_valid: bool | None = None,
+        positive_pulse_width_attempts: int = 1,
     ) -> None:
         output_path = Path(path)
         preamble = waveform.preamble
         sample_rate = 1.0 / preamble.interval
         device = self._idn or "SIGLENT SDS3104X HD"
+        pulse_width_valid = (
+            math.isfinite(positive_pulse_width_s)
+            if positive_pulse_width_valid is None
+            else bool(positive_pulse_width_valid) and math.isfinite(positive_pulse_width_s)
+        )
         with output_path.open("wb") as output_file:
             np.savez_compressed(
                 output_file,
@@ -377,6 +458,12 @@ class SDS3104XHDClient:
                 voltage_v=waveform.voltage_v.astype(np.float32, copy=False),
                 adc=waveform.adc.astype(np.int16, copy=False),
                 positive_pulse_width_s=np.asarray(positive_pulse_width_s, dtype=np.float64),
+                positive_pulse_width_raw=np.asarray(positive_pulse_width_raw, dtype=np.str_),
+                positive_pulse_width_valid=np.asarray(pulse_width_valid, dtype=np.bool_),
+                positive_pulse_width_attempts=np.asarray(
+                    positive_pulse_width_attempts,
+                    dtype=np.int32,
+                ),
                 device=np.asarray(device),
                 ip=np.asarray(self.config.ip),
                 channel=np.asarray(self.config.channel),

@@ -6,7 +6,9 @@ import numpy as np
 import pytest
 
 from sds3104xhd_client import (
+    AcquisitionStopped,
     PREAMBLE_MIN_BYTES,
+    PWID_SINGLE_MAX_ATTEMPTS,
     SDS3104XHDClient,
     SDS3104XHDConfig,
     ScopeWaveform,
@@ -133,6 +135,106 @@ def test_positive_pulse_width_unavailable_logs_warning(monkeypatch, caplog) -> N
     assert "[000025] PWID unavailable: ****" in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("responses", "expected_attempts"),
+    [
+        (["1.3447E-07"], 1),
+        (["****", "1.3447E-07"], 2),
+        (["****", "****", "****", "1.3447E-07"], 4),
+    ],
+)
+def test_single_is_rearmed_until_pwid_is_valid(
+    monkeypatch,
+    responses: list[str],
+    expected_attempts: int,
+) -> None:
+    client = SDS3104XHDClient(SDS3104XHDConfig())
+    singles: list[int] = []
+    remaining = iter(responses)
+    monkeypatch.setattr(client, "acquire_single", lambda: singles.append(1) or 0.1)
+    monkeypatch.setattr(client, "query", lambda _command: next(remaining))
+
+    result = client.acquire_single_with_pwid_retry(capture_index=1)
+
+    assert len(singles) == expected_attempts
+    assert result.attempts == expected_attempts
+    assert result.pulse_width_valid is True
+    assert result.pulse_width_s == pytest.approx(1.3447e-7)
+    assert result.pulse_width_raw == "1.3447E-07"
+
+
+def test_five_invalid_pwid_frames_keep_last_acquisition(monkeypatch, caplog) -> None:
+    client = SDS3104XHDClient(SDS3104XHDConfig())
+    frames: list[int] = []
+    monkeypatch.setattr(
+        client,
+        "acquire_single",
+        lambda: frames.append(len(frames) + 1) or float(frames[-1]),
+    )
+    monkeypatch.setattr(client, "query", lambda _command: "****")
+
+    with caplog.at_level("INFO"):
+        result = client.acquire_single_with_pwid_retry(capture_index=1)
+
+    assert frames == [1, 2, 3, 4, 5]
+    assert result.attempts == PWID_SINGLE_MAX_ATTEMPTS
+    assert result.pulse_width_valid is False
+    assert np.isnan(result.pulse_width_s)
+    assert result.pulse_width_raw == "****"
+    assert result.single_seconds == pytest.approx(5.0)
+    assert "[000001] Scope Single attempt 5/5" in caplog.text
+    assert "PWID unavailable after 5 Single attempts; using last acquisition" in caplog.text
+
+
+def test_pwid_query_communication_error_is_not_retried(monkeypatch) -> None:
+    client = SDS3104XHDClient(SDS3104XHDConfig())
+    singles: list[int] = []
+    monkeypatch.setattr(client, "acquire_single", lambda: singles.append(1) or 0.1)
+
+    def timeout(_command: str) -> str:
+        raise TimeoutError("VISA timeout")
+
+    monkeypatch.setattr(client, "query", timeout)
+
+    with pytest.raises(TimeoutError, match="VISA timeout"):
+        client.acquire_single_with_pwid_retry(capture_index=1)
+    assert len(singles) == 1
+
+
+def test_retry_log_shows_each_new_single_and_final_value(monkeypatch, caplog) -> None:
+    client = SDS3104XHDClient(SDS3104XHDConfig())
+    responses = iter(["****", "****", "1.3447E-07"])
+    monkeypatch.setattr(client, "acquire_single", lambda: 0.1)
+    monkeypatch.setattr(client, "query", lambda _command: next(responses))
+
+    with caplog.at_level("INFO"):
+        result = client.acquire_single_with_pwid_retry(capture_index=1)
+
+    assert result.attempts == 3
+    assert "[000001] Scope Single attempt 1/5" in caplog.text
+    assert "[000001] Scope Single attempt 2/5" in caplog.text
+    assert "[000001] Scope Single attempt 3/5" in caplog.text
+    assert caplog.text.count("[000001] PWID unavailable: ****") == 2
+    assert "[000001] PWID = 134.47 ns" in caplog.text
+
+
+def test_retry_checks_stop_after_single_before_query(monkeypatch) -> None:
+    client = SDS3104XHDClient(SDS3104XHDConfig())
+    singles: list[int] = []
+    queries: list[str] = []
+    stop_checks = iter([False, True])
+    monkeypatch.setattr(client, "acquire_single", lambda: singles.append(1) or 0.1)
+    monkeypatch.setattr(client, "query", lambda command: queries.append(command) or "****")
+
+    with pytest.raises(AcquisitionStopped):
+        client.acquire_single_with_pwid_retry(
+            capture_index=1,
+            should_stop=lambda: next(stop_checks),
+        )
+    assert len(singles) == 1
+    assert queries == []
+
+
 def test_time_value_formatting() -> None:
     assert format_time_value(1.3447e-7) == "134.47 ns"
     assert format_time_value(2.53e-6) == "2.53 μs"
@@ -153,7 +255,15 @@ def test_npz_save_keeps_tmp_name_and_required_dtypes(tmp_path) -> None:
     client = SDS3104XHDClient(SDS3104XHDConfig())
     output = tmp_path / "000001.npz.tmp"
 
-    client.save_npz(output, waveform, index=1, positive_pulse_width_s=1.3447e-7)
+    client.save_npz(
+        output,
+        waveform,
+        index=1,
+        positive_pulse_width_s=1.3447e-7,
+        positive_pulse_width_raw="1.3447E-07",
+        positive_pulse_width_valid=True,
+        positive_pulse_width_attempts=3,
+    )
 
     assert output.is_file()
     assert not (tmp_path / "000001.npz.tmp.npz").exists()
@@ -164,5 +274,11 @@ def test_npz_save_keeps_tmp_name_and_required_dtypes(tmp_path) -> None:
         assert saved["adc"].dtype == np.dtype("int16")
         assert saved["positive_pulse_width_s"].dtype == np.dtype("float64")
         assert float(saved["positive_pulse_width_s"]) == pytest.approx(1.3447e-7)
+        assert saved["positive_pulse_width_raw"].dtype.kind == "U"
+        assert str(saved["positive_pulse_width_raw"]) == "1.3447E-07"
+        assert saved["positive_pulse_width_valid"].dtype == np.dtype("bool")
+        assert bool(saved["positive_pulse_width_valid"])
+        assert saved["positive_pulse_width_attempts"].dtype == np.dtype("int32")
+        assert int(saved["positive_pulse_width_attempts"]) == 3
         assert int(saved["point_count"]) == 3
         assert str(saved["channel"]) == "C1"

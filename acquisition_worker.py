@@ -4,12 +4,14 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from threading import Event
 
 from PySide6.QtCore import QObject, Signal, Slot
 
 from file_pairing import is_capture_complete, remove_incomplete_pair
 from n9020a_client import N9020AClient
-from sds3104xhd_client import SDS3104XHDClient
+from pulse_width_summary import rebuild_pulse_width_summary, update_capture_summary
+from sds3104xhd_client import AcquisitionStopped, SDS3104XHDClient
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,10 @@ class AcquisitionWorker(QObject):
         self.n9020a_client = n9020a_client
         self.scope_client = scope_client
         self.request = request
+        self._stop_requested = Event()
+
+    def request_stop(self) -> None:
+        self._stop_requested.set()
 
     @Slot()
     def capture_one(self) -> None:
@@ -62,14 +68,17 @@ class AcquisitionWorker(QObject):
                     raise FileExistsError(f"Capture pair already exists: {stem}")
                 remove_incomplete_pair(folder, self.request.index)
 
-                single_seconds = self.scope_client.acquire_single()
-                positive_pulse_width_s = self.scope_client.read_positive_pulse_width(
-                    self.request.index
+                pulse_width = self.scope_client.acquire_single_with_pwid_retry(
+                    capture_index=self.request.index,
+                    should_stop=self._stop_requested.is_set,
                 )
+                self._raise_if_stopped()
                 csv_text = self.n9020a_client.fetch_csv_text()
+                self._raise_if_stopped()
                 read_started = time.monotonic()
                 waveform = self.scope_client.read_waveform()
                 read_seconds = time.monotonic() - read_started
+                self._raise_if_stopped()
 
                 self._write_csv_tmp(csv_tmp, csv_text)
                 save_started = time.monotonic()
@@ -77,10 +86,20 @@ class AcquisitionWorker(QObject):
                     npz_tmp,
                     waveform,
                     self.request.index,
-                    positive_pulse_width_s,
+                    pulse_width.pulse_width_s,
+                    positive_pulse_width_raw=pulse_width.pulse_width_raw,
+                    positive_pulse_width_valid=pulse_width.pulse_width_valid,
+                    positive_pulse_width_attempts=pulse_width.attempts,
                 )
                 save_seconds = time.monotonic() - save_started
                 self._commit_pair(csv_tmp, npz_tmp, csv_path, npz_path)
+                try:
+                    update_capture_summary(folder, self.request.index)
+                except Exception:
+                    csv_path.unlink(missing_ok=True)
+                    npz_path.unlink(missing_ok=True)
+                    rebuild_pulse_width_summary(folder)
+                    raise
 
                 self.finished.emit(
                     {
@@ -92,10 +111,13 @@ class AcquisitionWorker(QObject):
                             "point_count": waveform.point_count,
                             "min_voltage": float(waveform.voltage_v.min()),
                             "max_voltage": float(waveform.voltage_v.max()),
-                            "single_seconds": single_seconds,
+                            "single_seconds": pulse_width.single_seconds,
                             "read_seconds": read_seconds,
                             "save_seconds": save_seconds,
-                            "positive_pulse_width_s": positive_pulse_width_s,
+                            "positive_pulse_width_s": pulse_width.pulse_width_s,
+                            "positive_pulse_width_raw": pulse_width.pulse_width_raw,
+                            "positive_pulse_width_valid": pulse_width.pulse_width_valid,
+                            "positive_pulse_width_attempts": pulse_width.attempts,
                         },
                     }
                 )
@@ -117,6 +139,10 @@ class AcquisitionWorker(QObject):
                 }
             )
             self.completed.emit()
+        except AcquisitionStopped:
+            self._unlink(csv_tmp)
+            self._unlink(npz_tmp)
+            self.completed.emit()
         except Exception as exc:
             cleanup_errors: list[str] = []
             for path in (csv_tmp, npz_tmp):
@@ -135,6 +161,10 @@ class AcquisitionWorker(QObject):
                 message += "; cleanup failed: " + "; ".join(cleanup_errors)
             self.error.emit(message)
             self.completed.emit()
+
+    def _raise_if_stopped(self) -> None:
+        if self._stop_requested.is_set():
+            raise AcquisitionStopped("Capture stopped by user")
 
     def _write_csv_tmp(self, path: Path, csv_text: str) -> None:
         header = f"timestamp,{datetime.now().isoformat()}\n"

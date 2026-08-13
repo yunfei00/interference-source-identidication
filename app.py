@@ -242,7 +242,7 @@ class MainWindow(QMainWindow):
         self.export_scope_csv_check = QCheckBox("示波器 NPZ → CSV")
         self.export_n9020a_png_check = QCheckBox("N9020A CSV → PNG")
         self.export_scope_png_check = QCheckBox("示波器 NPZ → PNG")
-        self.export_summary_check = QCheckBox("正脉宽汇总 CSV")
+        self.export_summary_check = QCheckBox("重建正脉宽汇总 CSV")
         self.export_html_check = QCheckBox("正脉宽 HTML 分析报告")
         for checkbox in (
             self.export_scope_csv_check,
@@ -714,6 +714,8 @@ class MainWindow(QMainWindow):
         self._collect_once()
 
     def _stop_collect(self) -> None:
+        if self._worker is not None:
+            self._worker.request_stop()
         self.running = False
         self.timer.stop()
         self.status_label.setText("状态：已停止")
@@ -796,6 +798,7 @@ class MainWindow(QMainWindow):
                 f"Voltage: {scope_stats['min_voltage']:.3f} ~ "
                 f"{scope_stats['max_voltage']:.3f} V\n"
                 f"PWID: {format_time_value(scope_stats['positive_pulse_width_s'])}\n"
+                f"PWID attempts: {scope_stats['positive_pulse_width_attempts']}\n"
                 f"Read: {scope_stats['read_seconds']:.2f} s\n"
                 f"Save: {scope_stats['save_seconds']:.2f} s"
             )

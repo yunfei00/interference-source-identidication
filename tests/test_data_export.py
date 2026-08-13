@@ -68,6 +68,24 @@ def test_frequency_scan_ignores_non_frequency_and_nested_export(tmp_path: Path) 
     assert [item.frequency_mhz for item in datasets] == [600.0, 605.0]
 
 
+def test_scan_and_summary_support_plain_root_directory(tmp_path: Path) -> None:
+    _write_n9020a_csv(tmp_path / "000001.csv")
+    _write_npz(tmp_path / "000001.npz", 125e-9)
+
+    datasets = scan_frequency_datasets(tmp_path)
+    summary = run_data_export(
+        tmp_path,
+        tmp_path / "export",
+        ExportOptions(pulse_width_summary=True),
+    )
+
+    assert len(datasets) == 1
+    assert datasets[0].path == tmp_path
+    assert datasets[0].frequency_mhz is None
+    assert summary.failed == 0
+    assert (tmp_path / "pulse_width_summary.csv").is_file()
+
+
 def test_scope_npz_to_csv_has_required_columns_and_values(tmp_path: Path) -> None:
     source = tmp_path / "000001.npz"
     output = tmp_path / "export" / "000001_scope.csv"
@@ -143,9 +161,8 @@ def test_export_writes_scope_csv_and_all_summary_outputs(tmp_path: Path) -> None
 
     assert summary.failed == 0
     assert (output_root / "scope_csv" / "600MHz" / "000001_scope.csv").is_file()
-    assert (
-        output_root / "summary" / "600MHz" / "pulse_width_summary.csv"
-    ).is_file()
+    assert (data_root / "600MHz" / "pulse_width_summary.csv").is_file()
+    assert (data_root / "605.000MHz" / "pulse_width_summary.csv").is_file()
     assert (output_root / "summary" / "pulse_width_all.csv").is_file()
     assert (output_root / "summary" / "pulse_width_by_frequency.csv").is_file()
 
@@ -158,6 +175,7 @@ def test_export_writes_scope_csv_and_all_summary_outputs(tmp_path: Path) -> None
     assert [float(row["pulse_width_ns"]) for row in rows] == pytest.approx(
         [100.0, 120.0]
     )
+    assert [int(row["attempts"]) for row in rows] == [1, 1]
 
 
 def test_existing_scope_csv_is_skipped_when_overwrite_is_false(tmp_path: Path) -> None:
@@ -198,3 +216,26 @@ def test_html_report_is_single_file_offline_and_contains_frequency(tmp_path: Pat
     assert "Plotly.newPlot" in report
     assert '<script src="http' not in report
     assert not list(output.parent.glob("*.js"))
+
+
+def test_html_export_prefers_existing_summary_over_loading_npz(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    folder = data_root / "600MHz"
+    _write_n9020a_csv(folder / "000001.csv")
+    _write_npz(folder / "000001.npz", 100e-9)
+    first = run_data_export(
+        data_root,
+        data_root / "export",
+        ExportOptions(pulse_width_summary=True),
+    )
+    assert first.failed == 0
+    (folder / "000001.npz").write_bytes(b"not an npz")
+
+    html = run_data_export(
+        data_root,
+        data_root / "html-export",
+        ExportOptions(html_report=True),
+    )
+
+    assert html.failed == 0
+    assert (data_root / "html-export" / "reports" / "pulse_width_report.html").is_file()

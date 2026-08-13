@@ -11,6 +11,14 @@ from typing import Callable
 import numpy as np
 
 from data_visualizer import convert_csv_to_png, convert_npz_to_png
+from pulse_width_summary import (
+    PULSE_WIDTH_SUMMARY_FILENAME,
+    PULSE_WIDTH_SUMMARY_HEADER,
+    load_pulse_width_summary,
+    read_npz_summary_record,
+    rebuild_pulse_width_summary,
+    write_pulse_width_summary,
+)
 
 
 FREQUENCY_DIRECTORY_PATTERN = re.compile(
@@ -18,16 +26,8 @@ FREQUENCY_DIRECTORY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 SCOPE_CSV_HEADER = ("index", "time_s", "voltage_v", "adc")
-SUMMARY_HEADER = (
-    "index",
-    "pulse_width_s",
-    "pulse_width_ns",
-    "valid",
-    "npz_file",
-    "csv_file",
-    "pair_status",
-)
-ALL_SUMMARY_HEADER = ("frequency_mhz",) + SUMMARY_HEADER
+SUMMARY_HEADER = PULSE_WIDTH_SUMMARY_HEADER
+ALL_SUMMARY_HEADER = ("frequency_mhz",) + SUMMARY_HEADER + ("pair_status",)
 BY_FREQUENCY_HEADER = (
     "frequency_mhz",
     "total_samples",
@@ -98,13 +98,16 @@ class PulseWidthRecord:
     frequency_name: str
     index: int
     pulse_width_s: float
+    pulse_width_valid: bool
+    attempts: int
+    raw_value: str
     npz_file: str
     csv_file: str
     pair_status: str
 
     @property
     def valid(self) -> bool:
-        return math.isfinite(self.pulse_width_s)
+        return self.pulse_width_valid and math.isfinite(self.pulse_width_s)
 
     @property
     def pulse_width_ns(self) -> float:
@@ -181,6 +184,11 @@ def scan_frequency_datasets(
         if (frequency := parse_frequency_directory(child.name)) is not None
     ]
     datasets.sort(key=lambda item: (float(item.frequency_mhz), item.directory_name.casefold()))
+    if any(
+        path.is_file() and path.stem.isdigit() and path.suffix.casefold() in {".csv", ".npz"}
+        for path in root.iterdir()
+    ):
+        datasets.insert(0, FrequencyDataset(root, root.name, None))
     return datasets
 
 
@@ -256,16 +264,19 @@ def export_scope_npz_to_csv(
 def read_pulse_width_record(sample: SampleFiles, data_root: Path) -> tuple[PulseWidthRecord, str | None]:
     error: str | None = None
     pulse_width_s = float("nan")
+    attempts = 0
+    raw_value = ""
+    pulse_width_valid = False
     if not sample.npz_exists:
         pair_status = "missing_npz"
     else:
         pair_status = "paired" if sample.csv_exists else "missing_csv"
         try:
-            with np.load(sample.npz_path, allow_pickle=False) as data:
-                if "positive_pulse_width_s" in data:
-                    pulse_width_s = float(np.asarray(data["positive_pulse_width_s"]).reshape(-1)[0])
-                    if not math.isfinite(pulse_width_s):
-                        pulse_width_s = float("nan")
+            metadata = read_npz_summary_record(sample.npz_path, sample.csv_path)
+            pulse_width_s = metadata.pulse_width_s
+            pulse_width_valid = metadata.valid
+            attempts = metadata.attempts
+            raw_value = metadata.raw_value
         except Exception as exc:
             pair_status = "invalid_npz"
             error = f"{type(exc).__name__}: {exc}"
@@ -276,6 +287,9 @@ def read_pulse_width_record(sample: SampleFiles, data_root: Path) -> tuple[Pulse
             frequency_name=sample.dataset.directory_name,
             index=sample.index,
             pulse_width_s=pulse_width_s,
+            pulse_width_valid=pulse_width_valid,
+            attempts=attempts,
+            raw_value=raw_value,
             npz_file=_relative_path(sample.npz_path, data_root),
             csv_file=_relative_path(sample.csv_path, data_root),
             pair_status=pair_status,
@@ -346,7 +360,12 @@ def write_all_summary(records: list[PulseWidthRecord], output_path: str | Path) 
     return _write_csv_atomic(
         Path(output_path),
         ALL_SUMMARY_HEADER,
-        ((_format_number(record.frequency_mhz),) + _summary_row(record) for record in ordered),
+        (
+            (_format_number(record.frequency_mhz),)
+            + _summary_row(record)
+            + (record.pair_status,)
+            for record in ordered
+        ),
     )
 
 
@@ -598,8 +617,8 @@ def run_data_export(
             )
 
     needs_records = options.pulse_width_summary or options.html_report
-    metadata_jobs = len(samples) if needs_records else 0
-    summary_jobs = len(datasets) + 2 if options.pulse_width_summary else 0
+    metadata_jobs = len(datasets) if needs_records else 0
+    summary_jobs = 2 if options.pulse_width_summary else 0
     report_jobs = 1 if options.html_report else 0
     total_jobs = len(file_jobs) + metadata_jobs + summary_jobs + report_jobs
     summary = ExportSummary(total=total_jobs)
@@ -639,42 +658,33 @@ def run_data_export(
 
     records: list[PulseWidthRecord] = []
     if needs_records:
-        for sample in samples:
+        for dataset in datasets:
             if stopped():
                 summary.stopped = True
                 return summary
-            label = f"PWID: {sample.dataset.directory_name}/{sample.stem}"
+            rebuild = options.pulse_width_summary
+            label = (
+                f"Rebuild PWID summary: {dataset.directory_name}"
+                if rebuild
+                else f"Load PWID summary: {dataset.directory_name}"
+            )
             if on_start is not None:
                 on_start(position + 1, total_jobs, label)
-            record, error = read_pulse_width_record(sample, data_root_path)
-            records.append(record)
-            report_result(label, "failed" if error else "success", error or "")
+            try:
+                summary_path = dataset.path / PULSE_WIDTH_SUMMARY_FILENAME
+                if rebuild or not summary_path.is_file():
+                    rebuild_pulse_width_summary(dataset.path)
+                records.extend(
+                    _records_from_summary(dataset, data_root_path, summary_path)
+                )
+            except Exception as exc:
+                report_result(label, "failed", f"{type(exc).__name__}: {exc}")
+            else:
+                report_result(label, "success")
 
     statistics = compute_frequency_statistics(records)
     if options.pulse_width_summary:
-        by_frequency_records = {
-            dataset.directory_name: [
-                record for record in records if record.frequency_name == dataset.directory_name
-            ]
-            for dataset in datasets
-        }
         summary_outputs: list[tuple[str, Path, Callable[[], Path]]] = []
-        for dataset in datasets:
-            destination = (
-                output_root_path
-                / "summary"
-                / dataset.directory_name
-                / "pulse_width_summary.csv"
-            )
-            summary_outputs.append(
-                (
-                    f"PWID summary: {dataset.directory_name}",
-                    destination,
-                    lambda destination=destination, dataset=dataset: write_frequency_summary(
-                        by_frequency_records[dataset.directory_name], destination
-                    ),
-                )
-            )
         all_path = output_root_path / "summary" / "pulse_width_all.csv"
         by_frequency_path = output_root_path / "summary" / "pulse_width_by_frequency.csv"
         summary_outputs.extend(
@@ -728,15 +738,52 @@ def run_data_export(
     return summary
 
 
+def _records_from_summary(
+    dataset: FrequencyDataset,
+    data_root: Path,
+    summary_path: Path,
+) -> list[PulseWidthRecord]:
+    records: list[PulseWidthRecord] = []
+    summary_items = load_pulse_width_summary(summary_path)
+    completed_items = [
+        item
+        for item in summary_items
+        if (dataset.path / item.npz_file).is_file()
+        and (dataset.path / item.csv_file).is_file()
+    ]
+    if len(completed_items) != len(summary_items):
+        write_pulse_width_summary(summary_path, completed_items)
+
+    for item in completed_items:
+        npz_path = dataset.path / item.npz_file
+        csv_path = dataset.path / item.csv_file
+        records.append(
+            PulseWidthRecord(
+                frequency_mhz=dataset.frequency_mhz,
+                frequency_name=dataset.directory_name,
+                index=item.index,
+                pulse_width_s=item.pulse_width_s,
+                pulse_width_valid=item.valid,
+                attempts=item.attempts,
+                raw_value=item.raw_value,
+                npz_file=_relative_path(npz_path, data_root),
+                csv_file=_relative_path(csv_path, data_root),
+                pair_status="paired",
+            )
+        )
+    return records
+
+
 def _summary_row(record: PulseWidthRecord) -> tuple:
     return (
         record.index,
         _format_number(record.pulse_width_s),
         _format_number(record.pulse_width_ns),
         int(record.valid),
+        record.attempts,
+        record.raw_value,
         record.npz_file,
         record.csv_file,
-        record.pair_status,
     )
 
 
