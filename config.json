@@ -1,5 +1,7 @@
 {
   "scope": {
+    "ip": "192.168.1.50",
+    "channel": "C1",
     "single_timeout_sec": 30.0,
     "trigger_poll_interval_ms": 50,
     "pwid_settle_delay_ms": 200,

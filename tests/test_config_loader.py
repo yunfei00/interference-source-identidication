@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import pytest
+import config_loader
 
 from config_loader import AppConfig, ConfigError, load_config
 
@@ -13,6 +14,8 @@ def test_config_loads_all_timing_values(tmp_path) -> None:
         json.dumps(
             {
                 "scope": {
+                    "ip": "192.0.2.44",
+                    "channel": "C2",
                     "single_timeout_sec": 12.5,
                     "trigger_poll_interval_ms": 25,
                     "pwid_settle_delay_ms": 150,
@@ -35,6 +38,8 @@ def test_config_loads_all_timing_values(tmp_path) -> None:
     config = load_config(path)
 
     assert config.scope.single_timeout_sec == 12.5
+    assert config.scope.ip == "192.0.2.44"
+    assert config.scope.channel == "C2"
     assert config.scope.trigger_poll_interval_sec == pytest.approx(0.025)
     assert config.scope.pwid_settle_delay_sec == pytest.approx(0.15)
     assert config.scope.pwid_retry_delay_sec == pytest.approx(0.3)
@@ -71,6 +76,29 @@ def test_missing_file_uses_defaults_and_can_generate_config(tmp_path) -> None:
     assert json.loads(path.read_text(encoding="utf-8"))["scope"]["pwid_max_attempts"] == 3
 
 
+def test_packaged_app_prefers_config_beside_executable(monkeypatch, tmp_path) -> None:
+    exe_dir = tmp_path / "release"
+    working_dir = tmp_path / "working"
+    exe_dir.mkdir()
+    working_dir.mkdir()
+    (exe_dir / "config.json").write_text(
+        '{"scope": {"pwid_settle_delay_ms": 111}}',
+        encoding="utf-8",
+    )
+    (working_dir / "config.json").write_text(
+        '{"scope": {"pwid_settle_delay_ms": 222}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_loader.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(config_loader.sys, "executable", str(exe_dir / "app.exe"))
+    monkeypatch.chdir(working_dir)
+
+    config = load_config()
+
+    assert config.scope.pwid_settle_delay_ms == 111
+    assert config_loader.config_search_paths()[0] == (exe_dir / "config.json").resolve()
+
+
 @pytest.mark.parametrize(
     "content, message",
     [
@@ -78,6 +106,7 @@ def test_missing_file_uses_defaults_and_can_generate_config(tmp_path) -> None:
         ('{"scope": {"single_timeout_sec": 0}}', "single_timeout_sec"),
         ('{"scope": {"trigger_poll_interval_ms": 0}}', "trigger_poll_interval_ms"),
         ('{"scope": {"pwid_max_attempts": 11}}', "pwid_max_attempts"),
+        ('{"scope": {"channel": "C5"}}', "scope.channel"),
         ('{"pwid_delay_test": {"delays_ms": [-1]}}', "delays_ms"),
         ('{"pwid_delay_test": {"samples_per_delay": 0}}', "samples_per_delay"),
     ],

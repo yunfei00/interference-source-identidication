@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 
-DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+SOURCE_ROOT = Path(__file__).resolve().parent
+DEFAULT_CONFIG_PATH = SOURCE_ROOT / "config.json"
 
 
 class ConfigError(ValueError):
@@ -16,6 +18,8 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True)
 class ScopeTimingConfig:
+    ip: str = "192.168.1.50"
+    channel: str = "C1"
     single_timeout_sec: float = 30.0
     trigger_poll_interval_ms: int = 50
     pwid_settle_delay_ms: int = 200
@@ -67,7 +71,7 @@ def load_config(
     *,
     create_if_missing: bool = True,
 ) -> AppConfig:
-    config_path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
+    config_path = Path(path) if path is not None else _find_default_config_path()
     defaults = AppConfig()
     if not config_path.exists():
         if create_if_missing:
@@ -91,6 +95,8 @@ def load_config(
     delay_test_raw = _section(raw, "pwid_delay_test", config_path)
 
     scope = ScopeTimingConfig(
+        ip=_string(scope_raw, "ip", defaults.scope.ip, config_path),
+        channel=_string(scope_raw, "channel", defaults.scope.channel, config_path),
         single_timeout_sec=_number(
             scope_raw,
             "single_timeout_sec",
@@ -178,11 +184,43 @@ def _write_default_config(path: Path, config: AppConfig) -> None:
         raise ConfigError(f"Cannot create default config at {path}: {exc}") from exc
 
 
+def runtime_root() -> Path:
+    """Return the writable directory beside a packaged exe or the source root."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return SOURCE_ROOT
+
+
+def config_search_paths() -> tuple[Path, ...]:
+    """Return config candidates in runtime priority order without duplicates."""
+    candidates = [runtime_root() / "config.json", Path.cwd() / "config.json"]
+    if not getattr(sys, "frozen", False):
+        candidates.append(DEFAULT_CONFIG_PATH)
+    unique: list[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in unique:
+            unique.append(resolved)
+    return tuple(unique)
+
+
+def _find_default_config_path() -> Path:
+    candidates = config_search_paths()
+    return next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
+
+
 def _section(raw: dict[str, Any], name: str, path: Path) -> dict[str, Any]:
     value = raw.get(name, {})
     if not isinstance(value, dict):
         raise ConfigError(f"Invalid config in {path}: '{name}' must be an object")
     return value
+
+
+def _string(section: dict[str, Any], key: str, default: str, path: Path) -> str:
+    value = section.get(key, default)
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"Invalid config in {path}: '{key}' must be a non-empty string")
+    return value.strip()
 
 
 def _number(section: dict[str, Any], key: str, default: float, path: Path) -> float:
@@ -229,6 +267,7 @@ def _number_list(
 def _validate(config: AppConfig, path: Path) -> None:
     scope = config.scope
     checks = (
+        (scope.channel in {"C1", "C2", "C3", "C4"}, "scope.channel must be C1-C4"),
         (scope.single_timeout_sec > 0, "scope.single_timeout_sec must be > 0"),
         (
             scope.trigger_poll_interval_ms >= 1,

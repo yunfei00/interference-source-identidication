@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config_loader import AppConfig, load_config  # noqa: E402
+from config_loader import AppConfig, load_config, runtime_root  # noqa: E402
 from sds3104xhd_client import (  # noqa: E402
     SDS3104XHDClient,
     SDS3104XHDConfig,
@@ -26,7 +26,11 @@ from sds3104xhd_client import (  # noqa: E402
 from time_formatting import format_time_value  # noqa: E402
 
 
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+DEFAULT_OUTPUT_DIR = (
+    runtime_root() / "output"
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent / "output"
+)
 SUMMARY_FILENAME = "pwid_delay_test_results.csv"
 DETAIL_FILENAME = "pwid_delay_test_details.csv"
 
@@ -198,15 +202,15 @@ def _write_details_csv(path: Path, details: Sequence[PWIDDelayDetail]) -> None:
             )
 
 
-def _load_scope_state(path: Path) -> tuple[str | None, str]:
+def _load_scope_state(path: Path) -> tuple[str | None, str | None]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None, "C1"
+        return None, None
     if not isinstance(raw, dict):
-        return None, "C1"
+        return None, None
     ip = str(raw.get("scope_ip", "")).strip() or None
-    channel = str(raw.get("scope_channel", "C1")).strip() or "C1"
+    channel = str(raw.get("scope_channel", "")).strip() or None
     return ip, channel
 
 
@@ -253,8 +257,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Test SDS3104X HD PWID availability at different STOP-to-query delays."
     )
-    parser.add_argument("--ip", help="scope IP; defaults to collector_state.json scope_ip")
-    parser.add_argument("--channel", help="scope channel; defaults to saved scope_channel or C1")
+    parser.add_argument(
+        "--ip",
+        help="scope IP; defaults to collector_state.json, then config.json",
+    )
+    parser.add_argument(
+        "--channel",
+        help="scope channel; defaults to collector_state.json, then config.json",
+    )
     parser.add_argument("--samples", type=int, help="samples per tested delay")
     parser.add_argument("--delays", type=_parse_delays, help="comma-separated delays in ms")
     parser.add_argument(
@@ -269,12 +279,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_argument_parser()
     args = parser.parse_args(argv)
-    app_config = load_config(PROJECT_ROOT / "config.json")
-    saved_ip, saved_channel = _load_scope_state(PROJECT_ROOT / "collector_state.json")
-    ip = args.ip or saved_ip
-    if not ip:
-        parser.error("scope IP is required; pass --ip or connect once in app.py to save scope_ip")
-    channel = args.channel or saved_channel
+    app_config = load_config()
+    saved_ip, saved_channel = _load_scope_state(runtime_root() / "collector_state.json")
+    ip = args.ip or saved_ip or app_config.scope.ip
+    channel = args.channel or saved_channel or app_config.scope.channel
     samples = (
         app_config.pwid_delay_test.samples_per_delay
         if args.samples is None

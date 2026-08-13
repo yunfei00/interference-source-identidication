@@ -28,20 +28,44 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build EXE
+      - name: Build Windows executables
         run: |
           pyinstaller --onefile --name interference-source-identidication app.py
+          pyinstaller --onefile --name pwid-delay-tester tools/pwid_delay_tester.py
 
-      - name: Prepare zip package
+      - name: Prepare Windows zip packages
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path release -Force | Out-Null
-          Copy-Item dist/interference-source-identidication.exe release/
-          Compress-Archive -Path release/interference-source-identidication.exe -DestinationPath interference-source-identidication-${{ github.ref_name }}-windows.zip -Force
+          New-Item -ItemType Directory -Path release-app -Force | Out-Null
+          New-Item -ItemType Directory -Path release-pwid -Force | Out-Null
+
+          Copy-Item dist/interference-source-identidication.exe release-app/
+          Copy-Item config.json release-app/
+
+          Copy-Item dist/pwid-delay-tester.exe release-pwid/
+          Copy-Item config.json release-pwid/
+          Copy-Item README-PWID-TEST.txt release-pwid/
+
+          Compress-Archive -Path release-app/* -DestinationPath interference-source-identidication-${{ github.ref_name }}-windows.zip -Force
+          Compress-Archive -Path release-pwid/* -DestinationPath pwid-delay-tester-${{ github.ref_name }}-windows.zip -Force
+
+      - name: Verify Windows package contents
+        shell: pwsh
+        run: |
+          $appFiles = (Get-ChildItem release-app -File).Name
+          $pwidFiles = (Get-ChildItem release-pwid -File).Name
+          @('interference-source-identidication.exe', 'config.json') | ForEach-Object {
+            if ($_ -notin $appFiles) { throw "Missing main package file: $_" }
+          }
+          @('pwid-delay-tester.exe', 'config.json', 'README-PWID-TEST.txt') | ForEach-Object {
+            if ($_ -notin $pwidFiles) { throw "Missing PWID package file: $_" }
+          }
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          files: interference-source-identidication-${{ github.ref_name }}-windows.zip
+          files: |
+            interference-source-identidication-${{ github.ref_name }}-windows.zip
+            pwid-delay-tester-${{ github.ref_name }}-windows.zip
           generate_release_notes: true

@@ -288,7 +288,10 @@ class MainWindow(QMainWindow):
                 return CollectorState(**{key: value for key, value in data.items() if key in known_fields})
             except Exception:
                 pass
-        return CollectorState()
+        return CollectorState(
+            scope_ip=self.app_config.scope.ip,
+            scope_channel=self.app_config.scope.channel,
+        )
 
     def _save_state(self) -> None:
         self.state.address = self.address_edit.text().strip()

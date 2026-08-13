@@ -27,6 +27,8 @@ python app.py
 ```json
 {
   "scope": {
+    "ip": "192.168.1.50",
+    "channel": "C1",
     "single_timeout_sec": 30.0,
     "trigger_poll_interval_ms": 50,
     "pwid_settle_delay_ms": 200,
@@ -47,6 +49,7 @@ python app.py
 ```
 
 - `single_timeout_sec`：一次 Scope Single 等待 Trigger Stop 的上限。
+- `ip`、`channel`：独立 PWID tester 的默认示波器地址和通道；主程序中已保存的 GUI 状态仍优先。
 - `trigger_poll_interval_ms`：Trigger Status 查询间隔。
 - `pwid_settle_delay_ms`：Trigger Stop 后、查询 PWID 前的稳定等待。
 - `pwid_retry_delay_ms`：PWID 无效后、重新 Single 前的等待。
