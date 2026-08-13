@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from acquisition_worker import AcquisitionWorker, CaptureRequest
+from config_loader import ConfigError, load_config
 from data_export import ExportOptions
 from data_export_worker import DataExportWorker
 from file_pairing import is_capture_complete, next_capture_index
@@ -58,7 +59,6 @@ class CollectorState:
     scope_enabled: bool = True
     scope_ip: str = "192.168.1.50"
     scope_channel: str = "C1"
-    scope_single_timeout_sec: int = 30
 
 
 class MainWindow(QMainWindow):
@@ -85,6 +85,7 @@ class MainWindow(QMainWindow):
         self.timer.setSingleShot(True)
         self.timer.timeout.connect(self._collect_once)
 
+        self.app_config = load_config()
         self.state = self._load_state()
         self._build_ui()
         self._load_state_to_ui()
@@ -130,11 +131,6 @@ class MainWindow(QMainWindow):
         self.scope_channel_combo = QComboBox()
         self.scope_channel_combo.addItems(["C1", "C2", "C3", "C4"])
         form.addRow("Scope Channel", self.scope_channel_combo)
-
-        self.scope_timeout_spin = QSpinBox()
-        self.scope_timeout_spin.setRange(1, 3600)
-        self.scope_timeout_spin.setSuffix(" 秒")
-        form.addRow("Single 超时", self.scope_timeout_spin)
 
         scope_btn_row = QHBoxLayout()
         self.scope_connect_btn = QPushButton("连接示波器")
@@ -307,7 +303,6 @@ class MainWindow(QMainWindow):
         self.state.scope_enabled = self.scope_enabled_check.isChecked()
         self.state.scope_ip = self.scope_ip_edit.text().strip() or "192.168.1.50"
         self.state.scope_channel = self.scope_channel_combo.currentText()
-        self.state.scope_single_timeout_sec = self.scope_timeout_spin.value()
         STATE_FILE.write_text(
             json.dumps(asdict(self.state), ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -329,7 +324,6 @@ class MainWindow(QMainWindow):
             self.scope_ip_edit.setText(self.state.scope_ip)
             channel_index = self.scope_channel_combo.findText(self.state.scope_channel)
             self.scope_channel_combo.setCurrentIndex(max(channel_index, 0))
-            self.scope_timeout_spin.setValue(self.state.scope_single_timeout_sec)
             self._on_time_domain_toggled(self.state.time_domain_enabled)
             self._on_scope_enabled_toggled(self.state.scope_enabled)
         finally:
@@ -372,7 +366,13 @@ class MainWindow(QMainWindow):
 
         try:
             remote_csv_path = self.remote_csv_edit.text().strip() or r"D:\\data.csv"
-            self.client = N9020AClient(N9020AConfig(resource=addr, remote_csv_path=remote_csv_path))
+            self.client = N9020AClient(
+                N9020AConfig(
+                    resource=addr,
+                    timeout_ms=self.app_config.n9020a.visa_timeout_ms,
+                    remote_csv_path=remote_csv_path,
+                )
+            )
             self.client.connect()
             self.connected = True
             self.connect_btn.setText("断开仪表")
@@ -391,10 +391,17 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先填写示波器 IP")
             return
 
+        timing = self.app_config.scope
         config = SDS3104XHDConfig(
             ip=ip,
             channel=self.scope_channel_combo.currentText(),
-            single_timeout_sec=self.scope_timeout_spin.value(),
+            timeout_ms=timing.visa_timeout_ms,
+            single_timeout_sec=timing.single_timeout_sec,
+            chunk_size=timing.chunk_size_bytes,
+            trigger_poll_interval_sec=timing.trigger_poll_interval_sec,
+            pwid_settle_delay_sec=timing.pwid_settle_delay_sec,
+            pwid_retry_delay_sec=timing.pwid_retry_delay_sec,
+            pwid_max_attempts=timing.pwid_max_attempts,
         )
         candidate = SDS3104XHDClient(config)
         try:
@@ -857,7 +864,6 @@ class MainWindow(QMainWindow):
         self.scope_disconnect_btn.setEnabled(not busy and self.scope_connected)
         self.scope_ip_edit.setEnabled(not busy and not self.scope_connected)
         self.scope_channel_combo.setEnabled(not busy and not self.scope_connected)
-        self.scope_timeout_spin.setEnabled(not busy and not self.scope_connected)
         self.scope_enabled_check.setEnabled(not busy)
         self.folder_edit.setEnabled(not busy)
         self.folder_btn.setEnabled(not busy)
@@ -926,7 +932,11 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    w = MainWindow()
+    try:
+        w = MainWindow()
+    except ConfigError as exc:
+        QMessageBox.critical(None, "配置错误", str(exc))
+        sys.exit(1)
     w.resize(900, 850)
     w.show()
     sys.exit(app.exec())

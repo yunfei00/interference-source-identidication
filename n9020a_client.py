@@ -6,7 +6,7 @@ from dataclasses import dataclass
 @dataclass
 class N9020AConfig:
     resource: str
-    timeout_ms: int = 5000
+    timeout_ms: int
     remote_csv_path: str = r"D:\\data.csv"
 
 

@@ -59,18 +59,22 @@ TDIV_ENUM = (
 HORI_NUM = 10
 PREAMBLE_MIN_BYTES = 346
 BYTES_PER_POINT = 2
-PWID_SINGLE_MAX_ATTEMPTS = 5
+STOP_CHECK_MAX_INTERVAL_SEC = 0.05
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class SDS3104XHDConfig:
-    ip: str = "192.168.1.50"
-    channel: str = "C1"
-    timeout_ms: int = 60_000
-    single_timeout_sec: int = 30
-    chunk_size: int = 20 * 1024 * 1024
+    ip: str
+    channel: str
+    timeout_ms: int
+    single_timeout_sec: float
+    chunk_size: int
+    trigger_poll_interval_sec: float
+    pwid_settle_delay_sec: float
+    pwid_retry_delay_sec: float
+    pwid_max_attempts: int
 
 
 @dataclass(frozen=True)
@@ -298,19 +302,19 @@ class SDS3104XHDClient:
 
     def acquire_single_with_pwid_retry(
         self,
-        max_attempts: int = PWID_SINGLE_MAX_ATTEMPTS,
         *,
         capture_index: int | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> PulseWidthAcquisitionResult:
         """Acquire fresh Single frames until PWID is valid or attempts are exhausted."""
-        if max_attempts < 1:
+        attempt_limit = self.config.pwid_max_attempts
+        if attempt_limit < 1:
             raise ValueError("max_attempts must be at least 1")
 
         prefix = f"[{capture_index:06d}] " if capture_index is not None else ""
         last_raw = ""
         last_single_seconds = 0.0
-        for attempt in range(1, max_attempts + 1):
+        for attempt in range(1, attempt_limit + 1):
             if should_stop is not None and should_stop():
                 raise AcquisitionStopped("Capture stopped before Scope Single")
 
@@ -318,12 +322,24 @@ class SDS3104XHDClient:
                 "%sScope Single attempt %d/%d",
                 prefix,
                 attempt,
-                max_attempts,
+                attempt_limit,
             )
             last_single_seconds = self.acquire_single()
+            logger.info(
+                "%sTrigger STOP after %.1f ms",
+                prefix,
+                last_single_seconds * 1000.0,
+            )
 
             if should_stop is not None and should_stop():
                 raise AcquisitionStopped("Capture stopped after Scope Single")
+
+            logger.info(
+                "%sWaiting %.1f ms before PWID query",
+                prefix,
+                self.config.pwid_settle_delay_sec * 1000.0,
+            )
+            self._sleep_interruptibly(self.config.pwid_settle_delay_sec, should_stop)
 
             # Query errors are communication failures and must follow the device error path.
             last_raw = self.query("MEAS:ADV:P1:VAL?").strip()
@@ -343,19 +359,46 @@ class SDS3104XHDClient:
                 )
 
             logger.warning("%sPWID unavailable: %s", prefix, last_raw or "<empty>")
+            if attempt < attempt_limit:
+                logger.info(
+                    "%sWaiting %.1f ms before retry",
+                    prefix,
+                    self.config.pwid_retry_delay_sec * 1000.0,
+                )
+                self._sleep_interruptibly(self.config.pwid_retry_delay_sec, should_stop)
 
         logger.warning(
             "%sPWID unavailable after %d Single attempts; using last acquisition",
             prefix,
-            max_attempts,
+            attempt_limit,
         )
         return PulseWidthAcquisitionResult(
             pulse_width_s=float("nan"),
             pulse_width_raw=last_raw,
             pulse_width_valid=False,
-            attempts=max_attempts,
+            attempts=attempt_limit,
             single_seconds=last_single_seconds,
         )
+
+    @staticmethod
+    def _sleep_interruptibly(
+        seconds: float,
+        should_stop: Callable[[], bool] | None,
+    ) -> None:
+        """Wait for instrument settling while honoring a cooperative stop request."""
+        if should_stop is None:
+            if seconds > 0:
+                time.sleep(seconds)
+            return
+
+        deadline = time.monotonic() + max(seconds, 0.0)
+        while True:
+            if should_stop():
+                raise AcquisitionStopped("Capture stopped while waiting for Scope")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, STOP_CHECK_MAX_INTERVAL_SEC))
 
     def write(self, command: str) -> None:
         if self._inst is None:
@@ -388,7 +431,7 @@ class SDS3104XHDClient:
                     f"Scope Single timed out after {self.config.single_timeout_sec} seconds "
                     f"(last status: {status or '<empty>'})"
                 )
-            time.sleep(0.05)
+            time.sleep(self.config.trigger_poll_interval_sec)
 
     def read_preamble(self) -> WaveformPreamble:
         self.write(f":WAVeform:SOURce {self.config.channel}")

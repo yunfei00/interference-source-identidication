@@ -228,5 +228,6 @@ collector_state.json
 !tests/fixtures/
 !tests/fixtures/**/*.csv
 export/
+tools/output/
 *.csv.tmp
 *.npz.tmp

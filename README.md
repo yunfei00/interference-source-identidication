@@ -20,6 +20,42 @@ python app.py
 
 依赖包括 PySide6、PyVISA、NumPy、Matplotlib 和 Plotly。Matplotlib/Plotly 只由离线后处理代码按需导入。
 
+## 仪表时序配置
+
+项目根目录的 `config.json` 保存开发/设备级参数；`collector_state.json` 只保存仪表地址、数据目录、当前编号和 GUI 用户状态。正式采集启动时读取一次 `config.json`，因此调整参数后需要重新启动程序。缺少字段时自动使用代码内默认值；整个文件不存在时会自动生成默认配置；JSON 损坏或参数越界时会显示明确错误并停止启动。
+
+```json
+{
+  "scope": {
+    "single_timeout_sec": 30.0,
+    "trigger_poll_interval_ms": 50,
+    "pwid_settle_delay_ms": 200,
+    "pwid_retry_delay_ms": 200,
+    "pwid_max_attempts": 3,
+    "visa_timeout_ms": 60000,
+    "chunk_size_mb": 20
+  },
+  "n9020a": {
+    "visa_timeout_ms": 5000
+  },
+  "pwid_delay_test": {
+    "delays_ms": [0, 50, 100, 150, 200, 300, 500],
+    "samples_per_delay": 50,
+    "inter_sample_delay_ms": 200
+  }
+}
+```
+
+- `single_timeout_sec`：一次 Scope Single 等待 Trigger Stop 的上限。
+- `trigger_poll_interval_ms`：Trigger Status 查询间隔。
+- `pwid_settle_delay_ms`：Trigger Stop 后、查询 PWID 前的稳定等待。
+- `pwid_retry_delay_ms`：PWID 无效后、重新 Single 前的等待。
+- `pwid_max_attempts`：正式采集每个样本最多完整 Single 次数，默认 3。
+- `visa_timeout_ms`：对应仪表的 VISA 通信超时。
+- `chunk_size_mb`：示波器 VISA 与波形分块读取大小。
+
+主界面的“采集间隔”只控制正式样本 `000001` 到 `000002` 的节奏，不参与 PWID settle/retry 时序。
+
 ## 原始采集
 
 普通模式使用连续编号保存数据。N9020A Zero Span 扫频模式按频率建立目录：
@@ -41,8 +77,8 @@ data/
 每组联合采集顺序如下：
 
 1. SDS3104X HD 执行 Single 并等待 Trigger Status 为 Stop。
-2. 查询本次 Single 的正脉宽；无效时丢弃当前帧并重新执行完整 Single，最多 5 次。
-3. 有效时保留成功那次 Single；5 次均无效时保留第 5 次 Single。
+2. Trigger Stop 后按 `pwid_settle_delay_ms` 等待，再查询本次 Single 的正脉宽；无效时按 `pwid_retry_delay_ms` 等待并重新执行完整 Single，最多 3 次。
+3. 有效时保留成功那次 Single；3 次均无效时保留第 3 次 Single。
 4. 采集 N9020A CSV，并读取刚才保留的 SDS3104X HD 波形。
 5. 原子提交同编号 CSV/NPZ 文件对。
 6. 仅在正式 CSV/NPZ 都存在后，按 index 更新当前目录的 `pulse_width_summary.csv`。
@@ -57,15 +93,15 @@ data/
 MEAS:ADV:P1:TYPE PWID
 ```
 
-这会把高级测量 P1 配置为水平测量中的正脉宽。每次 Single 停止后立即发送：
+这会把高级测量 P1 配置为水平测量中的正脉宽。每次 Single 停止并完成配置的稳定等待后发送：
 
 ```text
 MEAS:ADV:P1:VAL?
 ```
 
-有效响应按 second 解析，例如 `1.3447E-07` 保存为 `1.3447e-07`。空响应、`---`、包含 `*` 的响应，以及任何不能转换为有限浮点数的内容，都会记录 warning，并触发一次新的完整 Single，而不是在同一帧重复查询 `VAL?`。默认最多执行 5 次 Single。
+有效响应按 second 解析，例如 `1.3447E-07` 保存为 `1.3447e-07`。空响应、`---`、包含 `*` 的响应，以及任何不能转换为有限浮点数的内容，都会记录 warning，并触发一次新的完整 Single，而不是在同一帧重复查询 `VAL?`。正式采集的默认上限由 `config.scope.pwid_max_attempts` 控制，默认执行 3 次 Single。
 
-一旦某次 PWID 有效，后续 `read_waveform()` 读取该次 Single 的波形。5 次全部无效时，PWID 保存为 `NaN`，同时保存第 5 次 Single 的波形，该组仍可正常完成。VISA timeout、connection reset 等查询通信异常不会被当作普通无效值重试，而是继续走设备错误流程。采集停止标志会在每次 Single 前后及后续读取/保存前检查，不使用 `QThread.terminate()`。
+一旦某次 PWID 有效，后续 `read_waveform()` 读取该次 Single 的波形。3 次全部无效时，PWID 保存为 `NaN`，同时保存第 3 次 Single 的波形，该组仍可正常完成。VISA timeout、connection reset 等查询通信异常不会被当作普通无效值重试，而是继续走设备错误流程。采集停止标志会在每次 Single 前后、settle/retry 等待中及后续读取/保存前检查，不使用 `QThread.terminate()`。
 
 GUI 使用统一的 `format_time_value()` 显示，例如：
 
@@ -75,6 +111,30 @@ GUI 使用统一的 `format_time_value()` 显示，例如：
 - `NaN` → `N/A`
 
 NPZ 中的权威值始终使用 second，不保存换算后的 ns/μs。
+
+## PWID 延时稳定性测试工具
+
+`tools/pwid_delay_tester.py` 用于在真实 SDS3104X HD 上比较不同“Trigger Stop → PWID Query”等待时间的成功率。它复用正式示波器驱动，每个测试样本只执行一次 Single 和一次 `MEAS:ADV:P1:VAL?`，不做正式采集的 3 次重试，也不读取波形、不保存 NPZ/图片、不连接 N9020A。
+
+```powershell
+python tools/pwid_delay_tester.py
+python tools/pwid_delay_tester.py --samples 20
+python tools/pwid_delay_tester.py --delays 50,100,150,200
+python tools/pwid_delay_tester.py --ip 192.168.1.50
+```
+
+IP 和 Channel 默认读取 `collector_state.json` 中保存的 Scope 设置；IP 未保存时必须传 `--ip`。测试延时、每个延时的样本数、样本间隔及正式 Scope 通信参数读取 `config.json`，命令行 `--samples`、`--delays`、`--ip`、`--channel` 优先于保存值。
+
+结果写入独立的 `tools/output/pwid_delay_test_results.csv` 和 `tools/output/pwid_delay_test_details.csv`，该目录已被 Git 忽略。工具选择成功率至少 99% 的最小测试延时；若没有延时达到 99%，则推荐成功率最高者中的最小延时。它只输出建议，不自动修改 `config.json`。
+
+推荐实机流程：
+
+1. 连接真实 SDS3104X HD，并确认触发条件稳定。
+2. 运行 `python tools/pwid_delay_tester.py`。
+3. 查看 summary 和 details CSV。
+4. 找出成功率至少 99% 的最短 delay。
+5. 将该值写入 `config.json` 的 `scope.pwid_settle_delay_ms`。
+6. 重新启动 `python app.py` 进行正式采集。
 
 ## SDS3104X HD NPZ 字段
 
@@ -192,4 +252,4 @@ python -m compileall .
 python -m pytest
 ```
 
-自动测试覆盖 1/2/4/5 次完整 Single、通信异常不重试、停止检查、最终波形对应最后一次 Single、CSV/NPZ 原子配对、NPZ 新字段、summary 创建/去重/缺失文件对/旧 NPZ 重建、普通与频点目录、HTML 优先读取 summary，以及已有绘图和离线报告功能。真实 N9020A/SDS3104X HD 的网络、SCPI 兼容性、Trigger Stop 时序和长时间连续采集仍需连接真实仪表验证。
+自动测试覆盖配置正常/缺字段/损坏/越界、1/2/3 次完整 Single、settle/retry 等待、可配置 Trigger polling、通信异常不重试、停止检查、PWID delay 统计和 99% 推荐策略、最终波形对应最后一次 Single、CSV/NPZ 原子配对、NPZ 新字段、summary 创建/去重/缺失文件对/旧 NPZ 重建、普通与频点目录、HTML 优先读取 summary，以及已有绘图和离线报告功能。真实 N9020A/SDS3104X HD 的网络、SCPI 兼容性、Trigger Stop 时序、最佳 settle delay 和长时间连续采集仍需连接真实仪表验证。

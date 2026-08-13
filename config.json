@@ -1,0 +1,27 @@
+{
+  "scope": {
+    "single_timeout_sec": 30.0,
+    "trigger_poll_interval_ms": 50,
+    "pwid_settle_delay_ms": 200,
+    "pwid_retry_delay_ms": 200,
+    "pwid_max_attempts": 3,
+    "visa_timeout_ms": 60000,
+    "chunk_size_mb": 20
+  },
+  "n9020a": {
+    "visa_timeout_ms": 5000
+  },
+  "pwid_delay_test": {
+    "delays_ms": [
+      0,
+      50,
+      100,
+      150,
+      200,
+      300,
+      500
+    ],
+    "samples_per_delay": 50,
+    "inter_sample_delay_ms": 200
+  }
+}

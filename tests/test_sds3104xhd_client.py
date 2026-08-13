@@ -4,11 +4,11 @@ import struct
 
 import numpy as np
 import pytest
+import sds3104xhd_client as scope_module
 
 from sds3104xhd_client import (
     AcquisitionStopped,
     PREAMBLE_MIN_BYTES,
-    PWID_SINGLE_MAX_ATTEMPTS,
     SDS3104XHDClient,
     SDS3104XHDConfig,
     ScopeWaveform,
@@ -19,6 +19,22 @@ from sds3104xhd_client import (
     parse_preamble,
 )
 from time_formatting import format_time_value
+
+
+def _scope_config(**overrides: object) -> SDS3104XHDConfig:
+    values: dict[str, object] = {
+        "ip": "192.0.2.1",
+        "channel": "C1",
+        "timeout_ms": 60_000,
+        "single_timeout_sec": 30.0,
+        "chunk_size": 20 * 1024 * 1024,
+        "trigger_poll_interval_sec": 0.05,
+        "pwid_settle_delay_sec": 0.0,
+        "pwid_retry_delay_sec": 0.0,
+        "pwid_max_attempts": 3,
+    }
+    values.update(overrides)
+    return SDS3104XHDConfig(**values)  # type: ignore[arg-type]
 
 
 def _make_preamble() -> bytes:
@@ -102,7 +118,7 @@ def test_positive_pulse_width_parser(raw: str, expected: float | None) -> None:
 
 
 def test_positive_pulse_width_configuration_command(monkeypatch) -> None:
-    client = SDS3104XHDClient(SDS3104XHDConfig())
+    client = SDS3104XHDClient(_scope_config())
     commands: list[str] = []
     monkeypatch.setattr(client, "write", commands.append)
 
@@ -112,7 +128,7 @@ def test_positive_pulse_width_configuration_command(monkeypatch) -> None:
 
 
 def test_positive_pulse_width_read_uses_advanced_p1_query(monkeypatch) -> None:
-    client = SDS3104XHDClient(SDS3104XHDConfig())
+    client = SDS3104XHDClient(_scope_config())
     queries: list[str] = []
 
     def query(command: str) -> str:
@@ -125,7 +141,7 @@ def test_positive_pulse_width_read_uses_advanced_p1_query(monkeypatch) -> None:
 
 
 def test_positive_pulse_width_unavailable_logs_warning(monkeypatch, caplog) -> None:
-    client = SDS3104XHDClient(SDS3104XHDConfig())
+    client = SDS3104XHDClient(_scope_config())
     monkeypatch.setattr(client, "query", lambda _command: "****")
 
     with caplog.at_level("WARNING"):
@@ -140,7 +156,7 @@ def test_positive_pulse_width_unavailable_logs_warning(monkeypatch, caplog) -> N
     [
         (["1.3447E-07"], 1),
         (["****", "1.3447E-07"], 2),
-        (["****", "****", "****", "1.3447E-07"], 4),
+        (["****", "****", "1.3447E-07"], 3),
     ],
 )
 def test_single_is_rearmed_until_pwid_is_valid(
@@ -148,7 +164,7 @@ def test_single_is_rearmed_until_pwid_is_valid(
     responses: list[str],
     expected_attempts: int,
 ) -> None:
-    client = SDS3104XHDClient(SDS3104XHDConfig())
+    client = SDS3104XHDClient(_scope_config())
     singles: list[int] = []
     remaining = iter(responses)
     monkeypatch.setattr(client, "acquire_single", lambda: singles.append(1) or 0.1)
@@ -163,8 +179,8 @@ def test_single_is_rearmed_until_pwid_is_valid(
     assert result.pulse_width_raw == "1.3447E-07"
 
 
-def test_five_invalid_pwid_frames_keep_last_acquisition(monkeypatch, caplog) -> None:
-    client = SDS3104XHDClient(SDS3104XHDConfig())
+def test_three_invalid_pwid_frames_keep_last_acquisition(monkeypatch, caplog) -> None:
+    client = SDS3104XHDClient(_scope_config())
     frames: list[int] = []
     monkeypatch.setattr(
         client,
@@ -176,18 +192,18 @@ def test_five_invalid_pwid_frames_keep_last_acquisition(monkeypatch, caplog) -> 
     with caplog.at_level("INFO"):
         result = client.acquire_single_with_pwid_retry(capture_index=1)
 
-    assert frames == [1, 2, 3, 4, 5]
-    assert result.attempts == PWID_SINGLE_MAX_ATTEMPTS
+    assert frames == [1, 2, 3]
+    assert result.attempts == 3
     assert result.pulse_width_valid is False
     assert np.isnan(result.pulse_width_s)
     assert result.pulse_width_raw == "****"
-    assert result.single_seconds == pytest.approx(5.0)
-    assert "[000001] Scope Single attempt 5/5" in caplog.text
-    assert "PWID unavailable after 5 Single attempts; using last acquisition" in caplog.text
+    assert result.single_seconds == pytest.approx(3.0)
+    assert "[000001] Scope Single attempt 3/3" in caplog.text
+    assert "PWID unavailable after 3 Single attempts; using last acquisition" in caplog.text
 
 
 def test_pwid_query_communication_error_is_not_retried(monkeypatch) -> None:
-    client = SDS3104XHDClient(SDS3104XHDConfig())
+    client = SDS3104XHDClient(_scope_config())
     singles: list[int] = []
     monkeypatch.setattr(client, "acquire_single", lambda: singles.append(1) or 0.1)
 
@@ -202,7 +218,7 @@ def test_pwid_query_communication_error_is_not_retried(monkeypatch) -> None:
 
 
 def test_retry_log_shows_each_new_single_and_final_value(monkeypatch, caplog) -> None:
-    client = SDS3104XHDClient(SDS3104XHDConfig())
+    client = SDS3104XHDClient(_scope_config())
     responses = iter(["****", "****", "1.3447E-07"])
     monkeypatch.setattr(client, "acquire_single", lambda: 0.1)
     monkeypatch.setattr(client, "query", lambda _command: next(responses))
@@ -211,15 +227,15 @@ def test_retry_log_shows_each_new_single_and_final_value(monkeypatch, caplog) ->
         result = client.acquire_single_with_pwid_retry(capture_index=1)
 
     assert result.attempts == 3
-    assert "[000001] Scope Single attempt 1/5" in caplog.text
-    assert "[000001] Scope Single attempt 2/5" in caplog.text
-    assert "[000001] Scope Single attempt 3/5" in caplog.text
+    assert "[000001] Scope Single attempt 1/3" in caplog.text
+    assert "[000001] Scope Single attempt 2/3" in caplog.text
+    assert "[000001] Scope Single attempt 3/3" in caplog.text
     assert caplog.text.count("[000001] PWID unavailable: ****") == 2
     assert "[000001] PWID = 134.47 ns" in caplog.text
 
 
 def test_retry_checks_stop_after_single_before_query(monkeypatch) -> None:
-    client = SDS3104XHDClient(SDS3104XHDConfig())
+    client = SDS3104XHDClient(_scope_config())
     singles: list[int] = []
     queries: list[str] = []
     stop_checks = iter([False, True])
@@ -233,6 +249,42 @@ def test_retry_checks_stop_after_single_before_query(monkeypatch) -> None:
         )
     assert len(singles) == 1
     assert queries == []
+
+
+def test_settle_and_retry_delays_are_called_without_real_sleep(monkeypatch) -> None:
+    client = SDS3104XHDClient(
+        _scope_config(pwid_settle_delay_sec=0.2, pwid_retry_delay_sec=0.3)
+    )
+    responses = iter(["****", "1.3447E-07"])
+    waits: list[float] = []
+    monkeypatch.setattr(client, "acquire_single", lambda: 0.087)
+    monkeypatch.setattr(client, "query", lambda _command: next(responses))
+    monkeypatch.setattr(
+        client,
+        "_sleep_interruptibly",
+        lambda seconds, _should_stop: waits.append(seconds),
+    )
+
+    result = client.acquire_single_with_pwid_retry(capture_index=1)
+
+    assert result.attempts == 2
+    assert waits == pytest.approx([0.2, 0.3, 0.2])
+
+
+def test_trigger_polling_uses_configured_interval(monkeypatch) -> None:
+    client = SDS3104XHDClient(_scope_config(trigger_poll_interval_sec=0.123))
+    statuses = iter(["RUN", "STOP"])
+    clock = iter([0.0, 0.1, 0.2])
+    sleeps: list[float] = []
+    monkeypatch.setattr(client, "write", lambda _command: None)
+    monkeypatch.setattr(client, "query", lambda _command: next(statuses))
+    monkeypatch.setattr(scope_module.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(scope_module.time, "sleep", sleeps.append)
+
+    elapsed = client.acquire_single()
+
+    assert elapsed == pytest.approx(0.2)
+    assert sleeps == [pytest.approx(0.123)]
 
 
 def test_time_value_formatting() -> None:
@@ -252,7 +304,7 @@ def test_npz_save_keeps_tmp_name_and_required_dtypes(tmp_path) -> None:
         voltage_v=np.asarray([-1.0, 0.0, 1.0], dtype=np.float32),
         preamble=preamble,
     )
-    client = SDS3104XHDClient(SDS3104XHDConfig())
+    client = SDS3104XHDClient(_scope_config())
     output = tmp_path / "000001.npz.tmp"
 
     client.save_npz(
