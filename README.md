@@ -1,13 +1,12 @@
 # N9020A + SDS3104X HD 联合采集工具
 
-这是一个基于 PySide6 的小型桌面工具，用于联合采集 Keysight N9020A 和 SIGLENT SDS3104X HD 数据，并在采集完成后独立导出客户交付文件和正脉宽分析报告。
+这是一个 PySide6 桌面工具，用于联合采集 Keysight N9020A 与 SIGLENT SDS3104X HD：
 
-项目采用明确的两层数据体系：
+- 采集阶段：N9020A 只保存 CSV；SDS3104X HD 只保存 NPZ，并保存高级测量 `DELAY` 元数据。
+- 后处理阶段：用户手动生成 Scope CSV、N9020A/Scope PNG、DELAY 汇总和离线 HTML 报告。
+- 自动恢复：N9020A 或 Scope 发生 VISA/I/O/timeout/connection reset 后，按配置等待并重连，再完整重采当前 index。
 
-- 原始采集：N9020A 保存 CSV；SDS3104X HD 保存 NPZ，并在同一个 NPZ 中保存正脉宽 PWID。
-- 离线后处理：按需生成 Scope CSV、CSV/NPZ 波形 PNG、PWID 汇总 CSV 和完全离线的 Plotly HTML 报告。
-
-采集 Worker 不导入 Matplotlib 或 Plotly，不生成 PNG、HTML 或示波器 CSV，也不做批量统计。导出与分析只有在用户手动点击“开始处理”后才会运行。
+采集 Worker 不导入 Matplotlib 或 Plotly，不生成图片、HTML 或 Scope CSV。数据导出与采集线程完全解耦。
 
 ## 安装与运行
 
@@ -18,11 +17,17 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
-依赖包括 PySide6、PyVISA、NumPy、Matplotlib 和 Plotly。Matplotlib/Plotly 只由离线后处理代码按需导入。
+依赖包括 PySide6、PyVISA、NumPy、Matplotlib 和 Plotly。Matplotlib/Plotly 仅由离线后处理按需导入。
 
-## 仪表时序配置
+## 配置
 
-项目根目录的 `config.json` 保存开发/设备级参数；`collector_state.json` 只保存仪表地址、数据目录、当前编号和 GUI 用户状态。正式采集启动时读取一次 `config.json`，因此调整参数后需要重新启动程序。缺少字段时自动使用代码内默认值；整个文件不存在时会自动生成默认配置；JSON 损坏或参数越界时会显示明确错误并停止启动。
+`config.json` 保存设备与时序参数；`collector_state.json` 只保存 GUI 状态、地址、目录和当前编号。打包程序按以下顺序查找配置：
+
+1. exe 同目录的 `config.json`
+2. 当前工作目录的 `config.json`
+3. 源码运行时的项目目录 `config.json`
+
+当前默认配置：
 
 ```json
 {
@@ -31,16 +36,25 @@ python app.py
     "channel": "C1",
     "single_timeout_sec": 30.0,
     "trigger_poll_interval_ms": 50,
-    "pwid_settle_delay_ms": 200,
-    "pwid_retry_delay_ms": 200,
-    "pwid_max_attempts": 3,
+    "delay_settle_delay_ms": 200,
+    "delay_retry_delay_ms": 200,
+    "delay_max_attempts": 3,
     "visa_timeout_ms": 60000,
-    "chunk_size_mb": 20
+    "chunk_size_mb": 20,
+    "reconnect_enabled": true,
+    "reconnect_delay_sec": 2.0,
+    "reconnect_max_attempts": 5
   },
   "n9020a": {
-    "visa_timeout_ms": 5000
+    "visa_timeout_ms": 5000,
+    "reconnect_enabled": true,
+    "reconnect_delay_sec": 15.0,
+    "reconnect_max_attempts": 5
   },
-  "pwid_delay_test": {
+  "acquisition": {
+    "max_sample_recovery_attempts": 5
+  },
+  "delay_measurement_test": {
     "delays_ms": [0, 50, 100, 150, 200, 300, 500],
     "samples_per_delay": 50,
     "inter_sample_delay_ms": 200
@@ -48,211 +62,161 @@ python app.py
 }
 ```
 
-- `single_timeout_sec`：一次 Scope Single 等待 Trigger Stop 的上限。
-- `ip`、`channel`：独立 PWID tester 的默认示波器地址和通道；主程序中已保存的 GUI 状态仍优先。
-- `trigger_poll_interval_ms`：Trigger Status 查询间隔。
-- `pwid_settle_delay_ms`：Trigger Stop 后、查询 PWID 前的稳定等待。
-- `pwid_retry_delay_ms`：PWID 无效后、重新 Single 前的等待。
-- `pwid_max_attempts`：正式采集每个样本最多完整 Single 次数，默认 3。
-- `visa_timeout_ms`：对应仪表的 VISA 通信超时。
-- `chunk_size_mb`：示波器 VISA 与波形分块读取大小。
+主要参数：
 
-主界面的“采集间隔”只控制正式样本 `000001` 到 `000002` 的节奏，不参与 PWID settle/retry 时序。
+- `scope.delay_settle_delay_ms`：Trigger Stop 后到查询 DELAY 的等待时间。
+- `scope.delay_retry_delay_ms`：DELAY 无效后、下一次新 Single 前的等待时间。
+- `scope.delay_max_attempts`：单个样本因 `****`/`---` 等无效测量而执行新 Single 的上限，默认 3。
+- `scope.reconnect_delay_sec`：Scope 通信失败后的重连等待，默认 2 秒。
+- `n9020a.reconnect_delay_sec`：N9020A 通信失败后的重连等待，默认 15 秒，用于覆盖频谱仪可能正在进行的自动校准时间。
+- `*.reconnect_max_attempts`：单次恢复时的重连上限，默认 5。
+- `acquisition.max_sample_recovery_attempts`：一个样本因通信故障而整组重采的上限，默认 5；它与 DELAY 无效重试是两套独立计数。
 
-## 原始采集
+旧配置中的 `pwid_settle_delay_ms`、`pwid_retry_delay_ms`、`pwid_max_attempts` 和 `pwid_delay_test` 仍可读取，并映射到新 DELAY 配置；新旧字段同时存在时新字段优先。新生成的配置和本文档只使用 DELAY 命名。
 
-普通模式使用连续编号保存数据。N9020A Zero Span 扫频模式按频率建立目录：
+主界面“采集间隔”只控制 `000001` 与 `000002` 两个正式样本之间的节奏，不参与 DELAY settle/retry 或仪表重连等待。
 
-```text
-data/
-  600.000MHz/
-    000001.csv       # N9020A 原始数据
-    000001.npz       # SDS3104X HD 原始波形和元数据
-    pulse_width_summary.csv
-  605.000MHz/
-    000001.csv
-    000001.npz
-    pulse_width_summary.csv
-```
+## DELAY 高级测量
 
-启用示波器时，只有同编号 CSV 和 NPZ 都成功写入，当前编号才会增加。程序先写 `*.csv.tmp` 和 `*.npz.tmp`，两者成功后再提交正式文件；半组失败会清理不完整文件并保留当前编号供下一次重试。关闭示波器时仍兼容原有 CSV-only 采集。
-
-每组联合采集顺序如下：
-
-1. SDS3104X HD 执行 Single 并等待 Trigger Status 为 Stop。
-2. Trigger Stop 后按 `pwid_settle_delay_ms` 等待，再查询本次 Single 的正脉宽；无效时按 `pwid_retry_delay_ms` 等待并重新执行完整 Single，最多 3 次。
-3. 有效时保留成功那次 Single；3 次均无效时保留第 3 次 Single。
-4. 采集 N9020A CSV，并读取刚才保留的 SDS3104X HD 波形。
-5. 原子提交同编号 CSV/NPZ 文件对。
-6. 仅在正式 CSV/NPZ 都存在后，按 index 更新当前目录的 `pulse_width_summary.csv`。
-
-主界面中的“启用 N9020A Zero Span 扫频采集”仅控制 N9020A 扫频模式，不会与 SDS3104X HD 时域波形混淆。
-
-## SDS3104X HD 正脉宽
-
-示波器连接成功后，以及正式采集任务开始前，程序都会发送：
+Scope 连接成功、正式任务开始前，以及 Scope 重连成功后，程序都会主动发送：
 
 ```text
-MEAS:ADV:P1:TYPE PWID
+MEAS:ADV:P1:TYPE DELAY
 ```
 
-这会把高级测量 P1 配置为水平测量中的正脉宽。每次 Single 停止并完成配置的稳定等待后发送：
+每次新 Single 停止后查询：
 
 ```text
 MEAS:ADV:P1:VAL?
 ```
 
-有效响应按 second 解析，例如 `1.3447E-07` 保存为 `1.3447e-07`。空响应、`---`、包含 `*` 的响应，以及任何不能转换为有限浮点数的内容，都会记录 warning，并触发一次新的完整 Single，而不是在同一帧重复查询 `VAL?`。正式采集的默认上限由 `config.scope.pwid_max_attempts` 控制，默认执行 3 次 Single。
+有效有限浮点数按 second 解析，例如 `1.3447E-07` 保存为 `1.3447e-07`。空字符串、`---`、包含 `*` 的响应、无法转换或非有限值统一为 `NaN`。
 
-一旦某次 PWID 有效，后续 `read_waveform()` 读取该次 Single 的波形。3 次全部无效时，PWID 保存为 `NaN`，同时保存第 3 次 Single 的波形，该组仍可正常完成。VISA timeout、connection reset 等查询通信异常不会被当作普通无效值重试，而是继续走设备错误流程。采集停止标志会在每次 Single 前后、settle/retry 等待中及后续读取/保存前检查，不使用 `QThread.terminate()`。
+DELAY 无效时会等待 `delay_retry_delay_ms` 并执行一个全新的 Single，而不是在同一帧连续查询。默认最多 3 次；最后仍无效时保存最后一次 Single 的波形以及 `delay_s=NaN`，整组 CSV/NPZ 仍可成功提交。通信 timeout 与无效测量不同，会进入仪表重连和整组重采流程。
 
-GUI 使用统一的 `format_time_value()` 显示，例如：
+GUI 使用统一时间格式显示，例如 `1.3447e-7 → 134.47 ns`、`2.3e-6 → 2.30 μs`、`NaN → N/A`。NPZ 的权威单位始终是 second。
 
-- `1.3447e-7` → `134.47 ns`
-- `2.3e-6` → `2.30 μs`
-- `0.0012` → `1.20 ms`
-- `NaN` → `N/A`
+## 联合采集与自动恢复
 
-NPZ 中的权威值始终使用 second，不保存换算后的 ns/μs。
+每组正常顺序：
 
-## PWID 延时稳定性测试工具
+1. Scope Single，并等待 Trigger Status 为 Stop。
+2. 等待 settle 时间，读取 `MEAS:ADV:P1:VAL?`；必要时用新 Single 重试。
+3. 读取 N9020A CSV。
+4. 读取最后保留的 Scope 波形。
+5. 写入 `*.csv.tmp`、`*.npz.tmp`，再原子提交同编号 CSV/NPZ。
+6. 更新当前目录的 `delay_summary.csv`，成功后 GUI 才递增 `current_index`。
 
-`tools/pwid_delay_tester.py` 用于在真实 SDS3104X HD 上比较不同“Trigger Stop → PWID Query”等待时间的成功率。它复用正式示波器驱动，每个测试样本只执行一次 Single 和一次 `MEAS:ADV:P1:VAL?`，不做正式采集的 3 次重试，也不读取波形、不保存 NPZ/图片、不连接 N9020A。
-
-```powershell
-python tools/pwid_delay_tester.py
-python tools/pwid_delay_tester.py --samples 20
-python tools/pwid_delay_tester.py --delays 50,100,150,200
-python tools/pwid_delay_tester.py --ip 192.168.1.50
-```
-
-IP 和 Channel 默认读取 `collector_state.json` 中保存的 Scope 设置；IP 未保存时必须传 `--ip`。测试延时、每个延时的样本数、样本间隔及正式 Scope 通信参数读取 `config.json`，命令行 `--samples`、`--delays`、`--ip`、`--channel` 优先于保存值。
-
-结果写入独立的 `tools/output/pwid_delay_test_results.csv` 和 `tools/output/pwid_delay_test_details.csv`，该目录已被 Git 忽略。工具选择成功率至少 99% 的最小测试延时；若没有延时达到 99%，则推荐成功率最高者中的最小延时。它只输出建议，不自动修改 `config.json`。
-
-推荐实机流程：
-
-1. 连接真实 SDS3104X HD，并确认触发条件稳定。
-2. 运行 `python tools/pwid_delay_tester.py`。
-3. 查看 summary 和 details CSV。
-4. 找出成功率至少 99% 的最短 delay。
-5. 将该值写入 `config.json` 的 `scope.pwid_settle_delay_ms`。
-6. 重新启动 `python app.py` 进行正式采集。
-
-## SDS3104X HD NPZ 字段
-
-NPZ 使用 `numpy.savez_compressed()` 保存：
-
-- `index`：采集编号，`int32`
-- `time_s`：时间轴，`float64`，单位 second
-- `voltage_v`：电压，`float32`，单位 volt
-- `adc`：原始 ADC，`int16`
-- `positive_pulse_width_s`：正脉宽，`float64`，单位 second；不可用时为 `NaN`
-- `positive_pulse_width_raw`：仪表原始响应，Unicode string，例如 `1.3447E-07` 或 `****`
-- `positive_pulse_width_valid`：是否为有效有限值，`bool`
-- `positive_pulse_width_attempts`：该样本实际执行的 Single 次数，`int32`
-- `device`、`ip`、`channel`、`point_count`
-- `adc_bit`、`vdiv`、`offset`、`probe`、`code_per_div`
-- `interval`、`sample_rate`、`tdiv`、`delay`
-
-NPZ 是示波器的唯一原始权威格式。相较同时写出数百万行 CSV，它写盘更快、文件更紧凑、数值精度更完整，并适合后续 FFT、STFT 和机器学习处理。Scope CSV 仅作为客户交付格式离线生成。
-
-## 数据导出与分析
-
-主界面底部的“数据导出与分析”区域与采集按钮和采集线程完全独立：
-
-1. 选择原始数据根目录，例如 `D:\data`。
-2. 输出目录默认设为 `D:\data\export`，也可另选目录。
-3. 选择“全部频点”或“当前目录”。
-4. 按需勾选一个或多个输出：Scope CSV、两类 PNG、重建 PWID 汇总 CSV、PWID HTML 报告。
-5. 点击“开始处理”。默认不覆盖已有输出；勾选“覆盖已有输出”后才会重建文件。
-
-所有选项默认不勾选。勾选“重建正脉宽汇总 CSV”会以 NPZ 为权威来源重新生成各数据目录的汇总文件；它不受普通导出文件的 overwrite 跳过规则影响。批量任务在独立 `QThread` 中运行，单文件失败会记录日志并继续；点击“停止”后会完成当前文件，再安全退出，不会调用 `QThread.terminate()`。
-
-“全部频点”只扫描数据根目录下一层名称类似 `600MHz`、`600.0MHz`、`600.000MHz` 的目录，忽略 `export`、`images`、`reports` 等非频率目录，也不会递归扫描自己生成的导出内容。“当前目录”直接处理所选目录中的数字编号 CSV/NPZ。
-
-默认输出结构如下：
+Zero Span 模式按频率建目录：
 
 ```text
 data/
   600.000MHz/
     000001.csv
     000001.npz
-    pulse_width_summary.csv
-  export/
-    scope_csv/
-      600.000MHz/
-        000001_scope.csv
-    images/
-      600.000MHz/
-        000001_csv.png
-        000001_npz.png
-    summary/
-      pulse_width_all.csv
-      pulse_width_by_frequency.csv
-    reports/
-      pulse_width_report.html
+    delay_summary.csv
+  605.000MHz/
+    000001.csv
+    000001.npz
+    delay_summary.csv
 ```
 
-除每个采集目录必需的轻量 `pulse_width_summary.csv` 外，Scope CSV、PNG、总汇总和 HTML 都保存在 `export/`。CSV/NPZ 通过数字 stem 配对；只有正式 CSV/NPZ 文件对才会进入频点级 summary。
+驱动只负责识别并抛出明确的 `N9020ACommunicationError` 或 `ScopeCommunicationError`；Worker 决定等待、重连和整组重采。业务数据 `ValueError` 不会被笼统标记为掉线。
 
-### Scope NPZ → CSV
+通信恢复规则：
 
-输出文件名使用 `000001_scope.csv`，避免与 N9020A 的 `000001.csv` 混淆。列固定为：
+- N9020A：断开损坏的 VISA session，先可中断地等待默认 15 秒，再进行最多 5 次 `connect + *IDN?`；每次失败后再次等待。日志会提示可能是自动校准或临时断线。
+- SDS3104X HD：断开 session，等待默认 2 秒，重连并验证 `*IDN?`，随后重新执行 `MEAS:ADV:P1:TYPE DELAY`。
+- 恢复成功后清理当前 index 的 `.tmp`/孤立文件，从 Scope Single 开始完整重采同一个 index；不会续用半组数据，也不会提前递增编号。
+- 重连等待每最多约 100 ms 检查一次停止请求，不调用 `QThread.terminate()`。
+- 单样本超过 `max_sample_recovery_attempts` 或重连次数上限后，连续采集停止并向用户报告错误，避免无限循环。
+
+日志统一包含 `[N9020A]`、`[SDS3104XHD]`、`[ACQUISITION]` 和六位采集编号，可区分校准等待、重连、成功及当前样本重启。
+
+本轮不通过“连续 CSV 完全相同”判断 N9020A 校准，因为稳定信号本来就可能产生相同数据。
+
+## 新 NPZ 字段
+
+新采集 NPZ 使用 `numpy.savez_compressed()`，主要字段：
+
+- `index`：`int32`
+- `time_s`：`float64`，second
+- `voltage_v`：`float32`，volt
+- `adc`：`int16`
+- `delay_s`：`float64`，second；不可用时为 `NaN`
+- `delay_raw`：Unicode string，例如 `1.3447E-07` 或 `****`
+- `delay_valid`：`bool`
+- `delay_attempts`：`int32`
+- `advanced_measurement_type`：字符串 `DELAY`
+- `device`、`ip`、`channel`、`point_count`
+- `adc_bit`、`vdiv`、`offset`、`probe`、`code_per_div`
+- `interval`、`sample_rate`、`tdiv`、`delay`
+
+新文件不再写入 `positive_pulse_width_*`。后处理仍可读取旧 NPZ：存在 `positive_pulse_width_s` 时明确标记为 `PWID (Legacy)`，不会把旧正脉宽静默当成 DELAY。
+
+## DELAY 汇总与旧 PWID 兼容
+
+新采集只写 `delay_summary.csv`：
 
 ```text
-index,time_s,voltage_v,adc
+index,delay_s,delay_ns,valid,attempts,raw_value,npz_file,csv_file
 ```
 
-转换按数据块写入，适合大波形。正脉宽不会在每一行重复，而是放入轻量汇总 CSV。
+已有 `pulse_width_summary.csv` 不会被删除或改写为 DELAY。分析选择规则：
 
-### CSV / NPZ → PNG
+- 检测到 `delay_summary.csv`：按 DELAY 分析，输出 `delay_all.csv`、`delay_by_frequency.csv` 和 `delay_report.html`。
+- 仅有 `pulse_width_summary.csv`：作为旧版正脉宽分析，HTML 明确显示 `Measurement Type: PWID (Legacy)`。
+- DELAY 与 legacy PWID 不会合并进同一组统计或同一份报告。
 
-- N9020A CSV 输出 `000001_csv.png`。程序会跳过仪表 metadata/header，优先识别 Frequency/Time 和 Amplitude/Power 数值列，分别支持 Spectrum 与 Zero Span。
-- Scope NPZ 输出 `000001_npz.png`，绘制 Time/Voltage，并显示 Channel、Sample Rate、Points 和 `Positive Pulse Width: 134.47 ns`；旧 NPZ 或无效值显示 `Positive Pulse Width: N/A`。
+统计保留 mean、median、population std、min、max、P05、P95、有效率和缺失文件数，数值列统一使用 ns 便于阅读，`NaN` 不参与数值统计但仍计入总数和无效数。
 
-图片统一为 12×6 inch、150 DPI 的 PNG。大波形使用最多 100,000 点的 min/max envelope 预览降采样，以尽量保留窄脉冲峰值；原始 NPZ 不会被修改。
+## 数据导出与图片
 
-### 正脉宽汇总 CSV
+主界面“数据导出与分析”与采集完全独立：选择数据根目录、输出目录、处理范围和输出类型后，手动点击“开始处理”。批量任务运行在独立 QThread 中，单文件失败会继续；默认不覆盖已有文件，停止会在当前文件完成后安全退出。
 
-每个 Zero Span 频率目录直接保存 `<频点>/pulse_width_summary.csv`；普通非扫频模式则保存 `<data_root>/pulse_width_summary.csv`。字段固定为：
+支持：
 
-```text
-index,pulse_width_s,pulse_width_ns,valid,attempts,raw_value,npz_file,csv_file
+- Scope NPZ → CSV：`000001_scope.csv`
+- N9020A CSV → PNG：`000001_csv.png`
+- Scope NPZ → PNG：`000001_npz.png`
+- 频点级/全局 DELAY 汇总和完全离线 Plotly HTML 报告
+
+新 NPZ 图片显示 `Measurement Type: DELAY` 和 `Delay: 134.47 ns`；旧文件显示 `Measurement Type: PWID (Legacy)`，不存在或无效值显示 `N/A`。大波形用最多 100,000 点的 min/max envelope 预览，保留窄峰能力优于简单步进；原始 NPZ 不会被修改。
+
+N9020A CSV 会跳过 metadata/header，并优先选择 Frequency/Time 与 Amplitude/Power 数值列。普通频谱显示 Frequency，Zero Span 显示 Time。输出统一为 12×6 inch、150 DPI PNG。
+
+## DELAY 测量延时测试工具
+
+`tools/delay_measurement_tester.py` 比较不同“Trigger Stop → DELAY Query”等待时间的成功率：
+
+```powershell
+python tools/delay_measurement_tester.py --help
+python tools/delay_measurement_tester.py
+python tools/delay_measurement_tester.py --samples 20 --delays 50,100,150,200
 ```
 
-采集时只在 CSV/NPZ 正式提交成功后更新。更新采用小型 index 映射和原子重写，相同 index 使用最新正式数据替换，不会产生重复行，同时会移除文件对已不存在的旧记录。损坏或旧格式 summary 会从正式 NPZ/CSV 文件对重建。
+工具主动配置 `MEAS:ADV:P1:TYPE DELAY`，每个测试样本只执行一次 Single 和一次 `MEAS:ADV:P1:VAL?`；不读取波形、不保存 NPZ、不生成图片、不访问 N9020A。结果写入：
 
-旧 NPZ 只有 `positive_pulse_width_s` 时，会推导 valid，attempts 使用 1，raw_value 使用对应数值字符串；完全没有 PWID 字段时使用 `NaN`、valid=0、attempts=0 和空 raw_value。
+- `tools/output/delay_measurement_test_results.csv`
+- `tools/output/delay_measurement_test_details.csv`
 
-`export/summary/pulse_width_all.csv` 合并全部频点，`export/summary/pulse_width_by_frequency.csv` 保存统计结果。生成 HTML 时优先读取已有频点级 summary；summary 不存在时才扫描 NPZ 并自动建立它。用户主动勾选“重建正脉宽汇总 CSV”时会强制以 NPZ 重建。
+它推荐成功率至少 99% 的最短 settle delay；若均未达到，则显示成功率最高的最短候选，但不会自动修改 `config.json`。旧 `tools/pwid_delay_tester.py` 暂时保留为兼容入口，新 Release 只发布 `delay-measurement-tester`。
 
-`export/summary/pulse_width_by_frequency.csv` 保存每个频点的：
+## Windows Release
 
-- 总样本数、有效/无效样本数、有效率
-- mean、median、population std、min、max、P05、P95（单位 ns）
-- 缺失 CSV / NPZ 数量
+每个版本 Tag 的 GitHub Release 同时包含两个独立包：
 
-所有统计排除 `NaN`，但总数和无效数会保留。
+- `interference-source-identidication-<TAG>-windows.zip`：主程序 exe + `config.json`
+- `delay-measurement-tester-<TAG>-windows.zip`：测试工具 exe + `config.json` + `README-DELAY-TEST.txt`
 
-### 完全离线 HTML 报告
-
-`export/reports/pulse_width_report.html` 是单个自包含文件，Plotly JavaScript 内联写入，不依赖 CDN 或互联网，也不要求客户安装 Python。Chrome/Edge 直接打开即可使用 Hover、Zoom、Pan、Legend 和 Reset Axes。
-
-报告包含：
-
-- 数据根目录、频率范围、频点数、总样本数、有效/无效数和有效率
-- 每频点 mean/median/std/min/max/P05/P95 表格
-- 可切换频点的正脉宽直方图
-- 样本序号散点图，hover 显示频率、编号、PWID 和原始 NPZ/CSV 路径
-- 全频率箱线图
-- 各频率 mean/median 趋势图
+解压后修改 exe 旁边的 `config.json` 即可生效。
 
 ## 测试
 
 ```powershell
 python -m compileall .
 python -m pytest
+python tools/delay_measurement_tester.py --help
 ```
 
-自动测试覆盖配置正常/缺字段/损坏/越界、1/2/3 次完整 Single、settle/retry 等待、可配置 Trigger polling、通信异常不重试、停止检查、PWID delay 统计和 99% 推荐策略、最终波形对应最后一次 Single、CSV/NPZ 原子配对、NPZ 新字段、summary 创建/去重/缺失文件对/旧 NPZ 重建、普通与频点目录、HTML 优先读取 summary，以及已有绘图和离线报告功能。真实 N9020A/SDS3104X HD 的网络、SCPI 兼容性、Trigger Stop 时序、最佳 settle delay 和长时间连续采集仍需连接真实仪表验证。
+自动测试覆盖 DELAY 命令、解析/NaN/三次新 Single、NPZ/summary/legacy 兼容、图片与 HTML 文案、通信异常分类、N9020A 15 秒等待、双仪表重连、Scope 重配 DELAY、整组同 index 重采、临时文件清理、恢复次数上限和等待中快速停止。真实仪表的网络、固件 SCPI 兼容性、自动校准行为、Trigger 时序、最佳 settle delay 及长时间连续采集仍需连接真实 N9020A/SDS3104X HD 验证。

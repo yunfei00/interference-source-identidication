@@ -80,6 +80,26 @@ def test_npz_reads_positive_pulse_width(tmp_path: Path) -> None:
     plot_data = load_npz_plot_data(path)
 
     assert plot_data.positive_pulse_width_s == pytest.approx(1.3447e-7)
+    assert plot_data.measurement_type == "PWID"
+
+
+def test_new_npz_reads_delay_without_treating_it_as_pwid(tmp_path: Path) -> None:
+    path = tmp_path / "delay.npz"
+    _write_npz(path, None)
+    with np.load(path) as source:
+        values = {name: source[name] for name in source.files}
+    values["delay_s"] = np.asarray(2.5e-7, dtype=np.float64)
+    values["advanced_measurement_type"] = np.asarray("DELAY")
+    np.savez(path, **values)
+
+    plot_data = load_npz_plot_data(path)
+    output = tmp_path / "delay.png"
+    convert_npz_to_png(path, output)
+
+    assert plot_data.measurement_type == "DELAY"
+    assert plot_data.delay_s == pytest.approx(2.5e-7)
+    assert np.isnan(plot_data.positive_pulse_width_s)
+    assert output.read_bytes().startswith(PNG_SIGNATURE)
 
 
 @pytest.mark.parametrize("pulse_width", [None, float("nan")])

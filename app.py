@@ -238,8 +238,8 @@ class MainWindow(QMainWindow):
         self.export_scope_csv_check = QCheckBox("示波器 NPZ → CSV")
         self.export_n9020a_png_check = QCheckBox("N9020A CSV → PNG")
         self.export_scope_png_check = QCheckBox("示波器 NPZ → PNG")
-        self.export_summary_check = QCheckBox("重建正脉宽汇总 CSV")
-        self.export_html_check = QCheckBox("正脉宽 HTML 分析报告")
+        self.export_summary_check = QCheckBox("重建 DELAY 汇总 CSV")
+        self.export_html_check = QCheckBox("DELAY HTML 分析报告")
         for checkbox in (
             self.export_scope_csv_check,
             self.export_n9020a_png_check,
@@ -374,6 +374,9 @@ class MainWindow(QMainWindow):
                     resource=addr,
                     timeout_ms=self.app_config.n9020a.visa_timeout_ms,
                     remote_csv_path=remote_csv_path,
+                    reconnect_enabled=self.app_config.n9020a.reconnect_enabled,
+                    reconnect_delay_sec=self.app_config.n9020a.reconnect_delay_sec,
+                    reconnect_max_attempts=self.app_config.n9020a.reconnect_max_attempts,
                 )
             )
             self.client.connect()
@@ -402,9 +405,12 @@ class MainWindow(QMainWindow):
             single_timeout_sec=timing.single_timeout_sec,
             chunk_size=timing.chunk_size_bytes,
             trigger_poll_interval_sec=timing.trigger_poll_interval_sec,
-            pwid_settle_delay_sec=timing.pwid_settle_delay_sec,
-            pwid_retry_delay_sec=timing.pwid_retry_delay_sec,
-            pwid_max_attempts=timing.pwid_max_attempts,
+            delay_settle_delay_sec=timing.delay_settle_delay_sec,
+            delay_retry_delay_sec=timing.delay_retry_delay_sec,
+            delay_max_attempts=timing.delay_max_attempts,
+            reconnect_enabled=timing.reconnect_enabled,
+            reconnect_delay_sec=timing.reconnect_delay_sec,
+            reconnect_max_attempts=timing.reconnect_max_attempts,
         )
         candidate = SDS3104XHDClient(config)
         try:
@@ -488,7 +494,7 @@ class MainWindow(QMainWindow):
             scope_csv=self.export_scope_csv_check.isChecked(),
             n9020a_png=self.export_n9020a_png_check.isChecked(),
             scope_png=self.export_scope_png_check.isChecked(),
-            pulse_width_summary=self.export_summary_check.isChecked(),
+            measurement_summary=self.export_summary_check.isChecked(),
             html_report=self.export_html_check.isChecked(),
             overwrite=self.conversion_overwrite_check.isChecked(),
             all_frequencies=self.export_all_frequencies_radio.isChecked(),
@@ -694,7 +700,7 @@ class MainWindow(QMainWindow):
             return
         if scope_enabled:
             try:
-                self.scope_client.configure_positive_pulse_width()
+                self.scope_client.configure_delay_measurement()
             except Exception as exc:
                 QMessageBox.critical(self, "示波器配置失败", str(exc))
                 return
@@ -751,11 +757,19 @@ class MainWindow(QMainWindow):
             frequency_mhz=frequency,
         )
         thread = QThread(self)
-        worker = AcquisitionWorker(self.client, self.scope_client, request)
+        worker = AcquisitionWorker(
+            self.client,
+            self.scope_client,
+            request,
+            max_sample_recovery_attempts=(
+                self.app_config.acquisition.max_sample_recovery_attempts
+            ),
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.capture_one)
         worker.finished.connect(self._on_capture_finished)
         worker.error.connect(self._on_capture_error)
+        worker.status.connect(self._on_capture_status)
         worker.completed.connect(thread.quit)
         worker.completed.connect(worker.deleteLater)
         thread.finished.connect(self._on_worker_thread_finished)
@@ -807,8 +821,8 @@ class MainWindow(QMainWindow):
                 f"Points: {scope_stats['point_count']:,}\n"
                 f"Voltage: {scope_stats['min_voltage']:.3f} ~ "
                 f"{scope_stats['max_voltage']:.3f} V\n"
-                f"PWID: {format_time_value(scope_stats['positive_pulse_width_s'])}\n"
-                f"PWID attempts: {scope_stats['positive_pulse_width_attempts']}\n"
+                f"DELAY: {format_time_value(scope_stats['delay_s'])}\n"
+                f"DELAY attempts: {scope_stats['delay_attempts']}\n"
                 f"Read: {scope_stats['read_seconds']:.2f} s\n"
                 f"Save: {scope_stats['save_seconds']:.2f} s"
             )
@@ -825,6 +839,10 @@ class MainWindow(QMainWindow):
         self._save_state()
         if not self._closing:
             QMessageBox.critical(self, "采集失败", message)
+
+    def _on_capture_status(self, message: str) -> None:
+        self.status_label.setText(f"状态：{message}")
+        logger.info(message)
 
     def _on_worker_thread_finished(self) -> None:
         self._worker_thread = None
@@ -934,6 +952,10 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     app = QApplication(sys.argv)
     try:
         w = MainWindow()

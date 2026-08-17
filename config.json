@@ -4,16 +4,25 @@
     "channel": "C1",
     "single_timeout_sec": 30.0,
     "trigger_poll_interval_ms": 50,
-    "pwid_settle_delay_ms": 200,
-    "pwid_retry_delay_ms": 200,
-    "pwid_max_attempts": 3,
+    "delay_settle_delay_ms": 200,
+    "delay_retry_delay_ms": 200,
+    "delay_max_attempts": 3,
     "visa_timeout_ms": 60000,
-    "chunk_size_mb": 20
+    "chunk_size_mb": 20,
+    "reconnect_enabled": true,
+    "reconnect_delay_sec": 2.0,
+    "reconnect_max_attempts": 5
   },
   "n9020a": {
-    "visa_timeout_ms": 5000
+    "visa_timeout_ms": 5000,
+    "reconnect_enabled": true,
+    "reconnect_delay_sec": 15.0,
+    "reconnect_max_attempts": 5
   },
-  "pwid_delay_test": {
+  "acquisition": {
+    "max_sample_recovery_attempts": 5
+  },
+  "delay_measurement_test": {
     "delays_ms": [
       0,
       50,

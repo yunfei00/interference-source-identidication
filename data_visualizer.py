@@ -20,10 +20,20 @@ SUPPORTED_SUFFIXES = {".csv", ".npz"}
 class NPZPlotData:
     time_s: np.ndarray
     voltage_v: np.ndarray
-    positive_pulse_width_s: float
+    measurement_s: float
+    measurement_type: str
     channel: str
     sample_rate: float
     point_count: int
+
+    @property
+    def delay_s(self) -> float:
+        return self.measurement_s if self.measurement_type == "DELAY" else float("nan")
+
+    @property
+    def positive_pulse_width_s(self) -> float:
+        """Legacy compatibility; never maps a DELAY value to PWID."""
+        return self.measurement_s if self.measurement_type == "PWID" else float("nan")
 
 
 @dataclass(frozen=True)
@@ -116,7 +126,15 @@ def load_npz_plot_data(
             max_plot_points,
         )
 
-        pulse_width = _npz_float(data, "positive_pulse_width_s", float("nan"))
+        if "delay_s" in data:
+            measurement = _npz_float(data, "delay_s", float("nan"))
+            measurement_type = "DELAY"
+        elif "positive_pulse_width_s" in data:
+            measurement = _npz_float(data, "positive_pulse_width_s", float("nan"))
+            measurement_type = "PWID"
+        else:
+            measurement = float("nan")
+            measurement_type = "UNKNOWN"
         channel = _npz_text(data, "channel", "--")
         sample_rate = _npz_float(data, "sample_rate", float("nan"))
         point_count = int(_npz_float(data, "point_count", int(valid.sum())))
@@ -124,7 +142,8 @@ def load_npz_plot_data(
     return NPZPlotData(
         time_s=time_s,
         voltage_v=voltage_v,
-        positive_pulse_width_s=pulse_width,
+        measurement_s=measurement,
+        measurement_type=measurement_type,
         channel=channel,
         sample_rate=sample_rate,
         point_count=point_count,
@@ -215,8 +234,23 @@ def convert_npz_to_png(
         details = [
             f"Channel: {plot_data.channel}",
             f"Points: {plot_data.point_count:,}",
-            f"Positive Pulse Width: {format_time_value(plot_data.positive_pulse_width_s)}",
         ]
+        if plot_data.measurement_type == "DELAY":
+            details.extend(
+                (
+                    "Measurement Type: DELAY",
+                    f"Delay: {format_time_value(plot_data.measurement_s)}",
+                )
+            )
+        elif plot_data.measurement_type == "PWID":
+            details.extend(
+                (
+                    "Measurement Type: PWID (Legacy)",
+                    f"Positive Pulse Width: {format_time_value(plot_data.measurement_s)}",
+                )
+            )
+        else:
+            details.extend(("Measurement Type: Unknown", "Advanced Measurement: N/A"))
         sample_rate = _format_sample_rate(plot_data.sample_rate)
         if sample_rate:
             details.insert(1, f"Sample Rate: {sample_rate}")

@@ -15,7 +15,7 @@ from sds3104xhd_client import (
     convert_adc_to_voltage,
     decode_word_data,
     parse_ieee4882_binary_block,
-    parse_positive_pulse_width,
+    parse_delay_value,
     parse_preamble,
 )
 from time_formatting import format_time_value
@@ -29,9 +29,9 @@ def _scope_config(**overrides: object) -> SDS3104XHDConfig:
         "single_timeout_sec": 30.0,
         "chunk_size": 20 * 1024 * 1024,
         "trigger_poll_interval_sec": 0.05,
-        "pwid_settle_delay_sec": 0.0,
-        "pwid_retry_delay_sec": 0.0,
-        "pwid_max_attempts": 3,
+        "delay_settle_delay_sec": 0.0,
+        "delay_retry_delay_sec": 0.0,
+        "delay_max_attempts": 3,
     }
     values.update(overrides)
     return SDS3104XHDConfig(**values)  # type: ignore[arg-type]
@@ -109,25 +109,25 @@ def test_voltage_conversion_matches_verified_scope_value() -> None:
         ("not-a-number", None),
     ],
 )
-def test_positive_pulse_width_parser(raw: str, expected: float | None) -> None:
-    result = parse_positive_pulse_width(raw)
+def test_delay_parser(raw: str, expected: float | None) -> None:
+    result = parse_delay_value(raw)
     if expected is None:
         assert np.isnan(result)
     else:
         assert result == pytest.approx(expected)
 
 
-def test_positive_pulse_width_configuration_command(monkeypatch) -> None:
+def test_delay_configuration_command(monkeypatch) -> None:
     client = SDS3104XHDClient(_scope_config())
     commands: list[str] = []
     monkeypatch.setattr(client, "write", commands.append)
 
-    client.configure_positive_pulse_width()
+    client.configure_delay_measurement()
 
-    assert commands == ["MEAS:ADV:P1:TYPE PWID"]
+    assert commands == ["MEAS:ADV:P1:TYPE DELAY"]
 
 
-def test_positive_pulse_width_read_uses_advanced_p1_query(monkeypatch) -> None:
+def test_delay_read_uses_advanced_p1_query(monkeypatch) -> None:
     client = SDS3104XHDClient(_scope_config())
     queries: list[str] = []
 
@@ -136,19 +136,19 @@ def test_positive_pulse_width_read_uses_advanced_p1_query(monkeypatch) -> None:
         return "1.3447E-07"
 
     monkeypatch.setattr(client, "query", query)
-    assert client.read_positive_pulse_width(25) == pytest.approx(1.3447e-07)
+    assert client.read_delay_value(25) == pytest.approx(1.3447e-07)
     assert queries == ["MEAS:ADV:P1:VAL?"]
 
 
-def test_positive_pulse_width_unavailable_logs_warning(monkeypatch, caplog) -> None:
+def test_delay_unavailable_logs_warning(monkeypatch, caplog) -> None:
     client = SDS3104XHDClient(_scope_config())
     monkeypatch.setattr(client, "query", lambda _command: "****")
 
     with caplog.at_level("WARNING"):
-        value = client.read_positive_pulse_width(25)
+        value = client.read_delay_value(25)
 
     assert np.isnan(value)
-    assert "[000025] PWID unavailable: ****" in caplog.text
+    assert "[000025] [SDS3104XHD] DELAY unavailable: ****" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -159,7 +159,7 @@ def test_positive_pulse_width_unavailable_logs_warning(monkeypatch, caplog) -> N
         (["****", "****", "1.3447E-07"], 3),
     ],
 )
-def test_single_is_rearmed_until_pwid_is_valid(
+def test_single_is_rearmed_until_delay_is_valid(
     monkeypatch,
     responses: list[str],
     expected_attempts: int,
@@ -170,16 +170,16 @@ def test_single_is_rearmed_until_pwid_is_valid(
     monkeypatch.setattr(client, "acquire_single", lambda: singles.append(1) or 0.1)
     monkeypatch.setattr(client, "query", lambda _command: next(remaining))
 
-    result = client.acquire_single_with_pwid_retry(capture_index=1)
+    result = client.acquire_single_with_delay_retry(capture_index=1)
 
     assert len(singles) == expected_attempts
     assert result.attempts == expected_attempts
-    assert result.pulse_width_valid is True
-    assert result.pulse_width_s == pytest.approx(1.3447e-7)
-    assert result.pulse_width_raw == "1.3447E-07"
+    assert result.delay_valid is True
+    assert result.delay_s == pytest.approx(1.3447e-7)
+    assert result.delay_raw == "1.3447E-07"
 
 
-def test_three_invalid_pwid_frames_keep_last_acquisition(monkeypatch, caplog) -> None:
+def test_three_invalid_delay_frames_keep_last_acquisition(monkeypatch, caplog) -> None:
     client = SDS3104XHDClient(_scope_config())
     frames: list[int] = []
     monkeypatch.setattr(
@@ -190,19 +190,19 @@ def test_three_invalid_pwid_frames_keep_last_acquisition(monkeypatch, caplog) ->
     monkeypatch.setattr(client, "query", lambda _command: "****")
 
     with caplog.at_level("INFO"):
-        result = client.acquire_single_with_pwid_retry(capture_index=1)
+        result = client.acquire_single_with_delay_retry(capture_index=1)
 
     assert frames == [1, 2, 3]
     assert result.attempts == 3
-    assert result.pulse_width_valid is False
-    assert np.isnan(result.pulse_width_s)
-    assert result.pulse_width_raw == "****"
+    assert result.delay_valid is False
+    assert np.isnan(result.delay_s)
+    assert result.delay_raw == "****"
     assert result.single_seconds == pytest.approx(3.0)
-    assert "[000001] Scope Single attempt 3/3" in caplog.text
-    assert "PWID unavailable after 3 Single attempts; using last acquisition" in caplog.text
+    assert "[000001] [SDS3104XHD] Scope Single attempt 3/3" in caplog.text
+    assert "DELAY unavailable after 3 Single attempts; using last acquisition" in caplog.text
 
 
-def test_pwid_query_communication_error_is_not_retried(monkeypatch) -> None:
+def test_delay_query_communication_error_is_not_retried(monkeypatch) -> None:
     client = SDS3104XHDClient(_scope_config())
     singles: list[int] = []
     monkeypatch.setattr(client, "acquire_single", lambda: singles.append(1) or 0.1)
@@ -213,7 +213,7 @@ def test_pwid_query_communication_error_is_not_retried(monkeypatch) -> None:
     monkeypatch.setattr(client, "query", timeout)
 
     with pytest.raises(TimeoutError, match="VISA timeout"):
-        client.acquire_single_with_pwid_retry(capture_index=1)
+        client.acquire_single_with_delay_retry(capture_index=1)
     assert len(singles) == 1
 
 
@@ -224,14 +224,14 @@ def test_retry_log_shows_each_new_single_and_final_value(monkeypatch, caplog) ->
     monkeypatch.setattr(client, "query", lambda _command: next(responses))
 
     with caplog.at_level("INFO"):
-        result = client.acquire_single_with_pwid_retry(capture_index=1)
+        result = client.acquire_single_with_delay_retry(capture_index=1)
 
     assert result.attempts == 3
-    assert "[000001] Scope Single attempt 1/3" in caplog.text
-    assert "[000001] Scope Single attempt 2/3" in caplog.text
-    assert "[000001] Scope Single attempt 3/3" in caplog.text
-    assert caplog.text.count("[000001] PWID unavailable: ****") == 2
-    assert "[000001] PWID = 134.47 ns" in caplog.text
+    assert "[000001] [SDS3104XHD] Scope Single attempt 1/3" in caplog.text
+    assert "[000001] [SDS3104XHD] Scope Single attempt 2/3" in caplog.text
+    assert "[000001] [SDS3104XHD] Scope Single attempt 3/3" in caplog.text
+    assert caplog.text.count("[000001] [SDS3104XHD] DELAY unavailable: ****") == 2
+    assert "[000001] [SDS3104XHD] DELAY = 134.47 ns" in caplog.text
 
 
 def test_retry_checks_stop_after_single_before_query(monkeypatch) -> None:
@@ -243,7 +243,7 @@ def test_retry_checks_stop_after_single_before_query(monkeypatch) -> None:
     monkeypatch.setattr(client, "query", lambda command: queries.append(command) or "****")
 
     with pytest.raises(AcquisitionStopped):
-        client.acquire_single_with_pwid_retry(
+        client.acquire_single_with_delay_retry(
             capture_index=1,
             should_stop=lambda: next(stop_checks),
         )
@@ -253,7 +253,7 @@ def test_retry_checks_stop_after_single_before_query(monkeypatch) -> None:
 
 def test_settle_and_retry_delays_are_called_without_real_sleep(monkeypatch) -> None:
     client = SDS3104XHDClient(
-        _scope_config(pwid_settle_delay_sec=0.2, pwid_retry_delay_sec=0.3)
+        _scope_config(delay_settle_delay_sec=0.2, delay_retry_delay_sec=0.3)
     )
     responses = iter(["****", "1.3447E-07"])
     waits: list[float] = []
@@ -265,7 +265,7 @@ def test_settle_and_retry_delays_are_called_without_real_sleep(monkeypatch) -> N
         lambda seconds, _should_stop: waits.append(seconds),
     )
 
-    result = client.acquire_single_with_pwid_retry(capture_index=1)
+    result = client.acquire_single_with_delay_retry(capture_index=1)
 
     assert result.attempts == 2
     assert waits == pytest.approx([0.2, 0.3, 0.2])
@@ -311,10 +311,10 @@ def test_npz_save_keeps_tmp_name_and_required_dtypes(tmp_path) -> None:
         output,
         waveform,
         index=1,
-        positive_pulse_width_s=1.3447e-7,
-        positive_pulse_width_raw="1.3447E-07",
-        positive_pulse_width_valid=True,
-        positive_pulse_width_attempts=3,
+        delay_s=1.3447e-7,
+        delay_raw="1.3447E-07",
+        delay_valid=True,
+        delay_attempts=3,
     )
 
     assert output.is_file()
@@ -324,13 +324,15 @@ def test_npz_save_keeps_tmp_name_and_required_dtypes(tmp_path) -> None:
         assert saved["time_s"].dtype == np.dtype("float64")
         assert saved["voltage_v"].dtype == np.dtype("float32")
         assert saved["adc"].dtype == np.dtype("int16")
-        assert saved["positive_pulse_width_s"].dtype == np.dtype("float64")
-        assert float(saved["positive_pulse_width_s"]) == pytest.approx(1.3447e-7)
-        assert saved["positive_pulse_width_raw"].dtype.kind == "U"
-        assert str(saved["positive_pulse_width_raw"]) == "1.3447E-07"
-        assert saved["positive_pulse_width_valid"].dtype == np.dtype("bool")
-        assert bool(saved["positive_pulse_width_valid"])
-        assert saved["positive_pulse_width_attempts"].dtype == np.dtype("int32")
-        assert int(saved["positive_pulse_width_attempts"]) == 3
+        assert saved["delay_s"].dtype == np.dtype("float64")
+        assert float(saved["delay_s"]) == pytest.approx(1.3447e-7)
+        assert saved["delay_raw"].dtype.kind == "U"
+        assert str(saved["delay_raw"]) == "1.3447E-07"
+        assert saved["delay_valid"].dtype == np.dtype("bool")
+        assert bool(saved["delay_valid"])
+        assert saved["delay_attempts"].dtype == np.dtype("int32")
+        assert int(saved["delay_attempts"]) == 3
+        assert str(saved["advanced_measurement_type"]) == "DELAY"
+        assert "positive_pulse_width_s" not in saved
         assert int(saved["point_count"]) == 3
         assert str(saved["channel"]) == "C1"

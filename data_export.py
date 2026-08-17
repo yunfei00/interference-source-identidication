@@ -11,6 +11,13 @@ from typing import Callable
 import numpy as np
 
 from data_visualizer import convert_csv_to_png, convert_npz_to_png
+from delay_summary import (
+    DELAY_SUMMARY_FILENAME,
+    DELAY_SUMMARY_HEADER,
+    load_delay_summary,
+    rebuild_delay_summary,
+    write_delay_summary,
+)
 from pulse_width_summary import (
     PULSE_WIDTH_SUMMARY_FILENAME,
     PULSE_WIDTH_SUMMARY_HEADER,
@@ -28,6 +35,7 @@ FREQUENCY_DIRECTORY_PATTERN = re.compile(
 SCOPE_CSV_HEADER = ("index", "time_s", "voltage_v", "adc")
 SUMMARY_HEADER = PULSE_WIDTH_SUMMARY_HEADER
 ALL_SUMMARY_HEADER = ("frequency_mhz",) + SUMMARY_HEADER + ("pair_status",)
+DELAY_ALL_SUMMARY_HEADER = ("frequency_mhz",) + DELAY_SUMMARY_HEADER + ("pair_status",)
 BY_FREQUENCY_HEADER = (
     "frequency_mhz",
     "total_samples",
@@ -52,6 +60,7 @@ class ExportOptions:
     n9020a_png: bool = False
     scope_png: bool = False
     pulse_width_summary: bool = False
+    measurement_summary: bool = False
     html_report: bool = False
     overwrite: bool = False
     all_frequencies: bool = True
@@ -63,6 +72,7 @@ class ExportOptions:
                 self.n9020a_png,
                 self.scope_png,
                 self.pulse_width_summary,
+                self.measurement_summary,
                 self.html_report,
             )
         )
@@ -93,25 +103,47 @@ class SampleFiles:
 
 
 @dataclass(frozen=True)
-class PulseWidthRecord:
+class MeasurementRecord:
     frequency_mhz: float | None
     frequency_name: str
     index: int
-    pulse_width_s: float
-    pulse_width_valid: bool
+    measurement_s: float
+    measurement_valid: bool
     attempts: int
     raw_value: str
     npz_file: str
     csv_file: str
     pair_status: str
+    measurement_type: str = "PWID"
 
     @property
     def valid(self) -> bool:
-        return self.pulse_width_valid and math.isfinite(self.pulse_width_s)
+        return self.measurement_valid and math.isfinite(self.measurement_s)
 
     @property
     def pulse_width_ns(self) -> float:
-        return self.pulse_width_s * 1e9 if self.valid else float("nan")
+        """Legacy compatibility; never exposes DELAY as pulse width."""
+        return self.measurement_ns if self.measurement_type == "PWID" else float("nan")
+
+    @property
+    def pulse_width_s(self) -> float:
+        return self.measurement_s if self.measurement_type == "PWID" else float("nan")
+
+    @property
+    def pulse_width_valid(self) -> bool:
+        return self.valid if self.measurement_type == "PWID" else False
+
+    @property
+    def measurement_ns(self) -> float:
+        return self.measurement_s * 1e9 if self.valid else float("nan")
+
+    @property
+    def measurement_label(self) -> str:
+        return "DELAY" if self.measurement_type == "DELAY" else "PWID (Legacy)"
+
+
+# Public compatibility alias for integrations written before DELAY became authoritative.
+PulseWidthRecord = MeasurementRecord
 
 
 @dataclass(frozen=True)
@@ -261,7 +293,10 @@ def export_scope_npz_to_csv(
     return output
 
 
-def read_pulse_width_record(sample: SampleFiles, data_root: Path) -> tuple[PulseWidthRecord, str | None]:
+def read_measurement_record(
+    sample: SampleFiles,
+    data_root: Path,
+) -> tuple[PulseWidthRecord, str | None]:
     error: str | None = None
     pulse_width_s = float("nan")
     attempts = 0
@@ -272,30 +307,66 @@ def read_pulse_width_record(sample: SampleFiles, data_root: Path) -> tuple[Pulse
     else:
         pair_status = "paired" if sample.csv_exists else "missing_csv"
         try:
-            metadata = read_npz_summary_record(sample.npz_path, sample.csv_path)
-            pulse_width_s = metadata.pulse_width_s
-            pulse_width_valid = metadata.valid
-            attempts = metadata.attempts
-            raw_value = metadata.raw_value
+            with np.load(sample.npz_path, allow_pickle=False) as data:
+                is_delay = "delay_s" in data
+                is_legacy_pwid = "positive_pulse_width_s" in data
+            if is_delay:
+                from delay_summary import read_npz_delay_record
+
+                metadata = read_npz_delay_record(sample.npz_path, sample.csv_path)
+                pulse_width_s = metadata.delay_s
+                pulse_width_valid = metadata.valid
+                attempts = metadata.attempts
+                raw_value = metadata.raw_value
+                measurement_type = "DELAY"
+            elif is_legacy_pwid:
+                metadata = read_npz_summary_record(sample.npz_path, sample.csv_path)
+                pulse_width_s = metadata.pulse_width_s
+                pulse_width_valid = metadata.valid
+                attempts = metadata.attempts
+                raw_value = metadata.raw_value
+                measurement_type = "PWID"
+            else:
+                # Old waveform NPZ files predate measurement metadata entirely.
+                # Keep them readable as unavailable legacy PWID, never as DELAY.
+                metadata = read_npz_summary_record(sample.npz_path, sample.csv_path)
+                pulse_width_s = metadata.pulse_width_s
+                pulse_width_valid = False
+                attempts = metadata.attempts
+                raw_value = metadata.raw_value
+                measurement_type = "PWID"
         except Exception as exc:
             pair_status = "invalid_npz"
             error = f"{type(exc).__name__}: {exc}"
+            measurement_type = "UNKNOWN"
+
+    if not sample.npz_exists:
+        measurement_type = "UNKNOWN"
 
     return (
-        PulseWidthRecord(
+        MeasurementRecord(
             frequency_mhz=sample.dataset.frequency_mhz,
             frequency_name=sample.dataset.directory_name,
             index=sample.index,
-            pulse_width_s=pulse_width_s,
-            pulse_width_valid=pulse_width_valid,
+            measurement_s=pulse_width_s,
+            measurement_valid=pulse_width_valid,
             attempts=attempts,
             raw_value=raw_value,
             npz_file=_relative_path(sample.npz_path, data_root),
             csv_file=_relative_path(sample.csv_path, data_root),
             pair_status=pair_status,
+            measurement_type=measurement_type,
         ),
         error,
     )
+
+
+def read_pulse_width_record(
+    sample: SampleFiles,
+    data_root: Path,
+) -> tuple[PulseWidthRecord, str | None]:
+    """Backward-compatible reader that preserves explicit measurement type."""
+    return read_measurement_record(sample, data_root)
 
 
 def compute_frequency_statistics(records: list[PulseWidthRecord]) -> list[FrequencyStatistics]:
@@ -308,7 +379,7 @@ def compute_frequency_statistics(records: list[PulseWidthRecord]) -> list[Freque
         groups.items(),
         key=lambda item: (_frequency_sort_value(item[0][0]), item[0][1].casefold()),
     ):
-        values = np.asarray([record.pulse_width_ns for record in group if record.valid])
+        values = np.asarray([record.measurement_ns for record in group if record.valid])
         valid_count = int(values.size)
         total_count = len(group)
         invalid_count = total_count - valid_count
@@ -345,9 +416,10 @@ def compute_frequency_statistics(records: list[PulseWidthRecord]) -> list[Freque
 
 
 def write_frequency_summary(records: list[PulseWidthRecord], output_path: str | Path) -> Path:
+    header = DELAY_SUMMARY_HEADER if _measurement_type(records) == "DELAY" else SUMMARY_HEADER
     return _write_csv_atomic(
         Path(output_path),
-        SUMMARY_HEADER,
+        header,
         (_summary_row(record) for record in sorted(records, key=lambda item: item.index)),
     )
 
@@ -357,9 +429,14 @@ def write_all_summary(records: list[PulseWidthRecord], output_path: str | Path) 
         records,
         key=lambda item: (_frequency_sort_value(item.frequency_mhz), item.frequency_name, item.index),
     )
+    header = (
+        DELAY_ALL_SUMMARY_HEADER
+        if _measurement_type(records) == "DELAY"
+        else ALL_SUMMARY_HEADER
+    )
     return _write_csv_atomic(
         Path(output_path),
-        ALL_SUMMARY_HEADER,
+        header,
         (
             (_format_number(record.frequency_mhz),)
             + _summary_row(record)
@@ -395,7 +472,7 @@ def write_by_frequency_summary(
     return _write_csv_atomic(Path(output_path), BY_FREQUENCY_HEADER, rows)
 
 
-def generate_pulse_width_html_report(
+def generate_measurement_html_report(
     data_root: str | Path,
     records: list[PulseWidthRecord],
     statistics: list[FrequencyStatistics],
@@ -411,6 +488,10 @@ def generate_pulse_width_html_report(
     total = len(records)
     valid = len(valid_records)
     invalid = total - valid
+    measurement_type = _measurement_type(records)
+    legacy = measurement_type == "PWID"
+    metric_name = "Positive Pulse Width" if legacy else "Delay"
+    measurement_display = "PWID (Legacy)" if legacy else "DELAY"
 
     histogram = go.Figure()
     frequency_groups = _records_by_frequency(records)
@@ -419,7 +500,7 @@ def generate_pulse_width_html_report(
         group = frequency_groups[name]
         histogram.add_trace(
             go.Histogram(
-                x=[record.pulse_width_ns for record in group if record.valid],
+                x=[record.measurement_ns for record in group if record.valid],
                 name=name,
                 visible=position == 0,
             )
@@ -434,7 +515,7 @@ def generate_pulse_width_html_report(
                             "method": "update",
                             "args": [
                                 {"visible": [index == position for index in range(len(group_names))]},
-                                {"title": f"Positive Pulse Width Histogram — {name}"},
+                                {"title": f"{metric_name} Histogram — {name}"},
                             ],
                         }
                         for position, name in enumerate(group_names)
@@ -445,11 +526,11 @@ def generate_pulse_width_html_report(
                     "y": 1.18,
                 }
             ],
-            title=f"Positive Pulse Width Histogram — {group_names[0]}",
+            title=f"{metric_name} Histogram — {group_names[0]}",
         )
     else:
-        histogram.update_layout(title="Positive Pulse Width Histogram — No valid samples")
-    histogram.update_xaxes(title="Positive Pulse Width (ns)")
+        histogram.update_layout(title=f"{metric_name} Histogram — No valid samples")
+    histogram.update_xaxes(title=f"{metric_name} (ns)")
     histogram.update_yaxes(title="Sample Count")
 
     scatter = go.Figure()
@@ -458,7 +539,7 @@ def generate_pulse_width_html_report(
         scatter.add_trace(
             go.Scatter(
                 x=[record.index for record in valid_group],
-                y=[record.pulse_width_ns for record in valid_group],
+                y=[record.measurement_ns for record in valid_group],
                 mode="markers",
                 name=name,
                 customdata=[
@@ -468,29 +549,29 @@ def generate_pulse_width_html_report(
                 hovertemplate=(
                     "Frequency: %{customdata[0]}<br>"
                     "Sample Index: %{x}<br>"
-                    "Pulse Width: %{y:.6g} ns<br>"
+                    f"{metric_name}: %{{y:.6g}} ns<br>"
                     "NPZ: %{customdata[1]}<br>"
                     "CSV: %{customdata[2]}<extra></extra>"
                 ),
             )
         )
-    scatter.update_layout(title="Pulse Width by Sample Index")
+    scatter.update_layout(title=f"{metric_name} by Sample Index")
     scatter.update_xaxes(title="Sample Index")
-    scatter.update_yaxes(title="Pulse Width (ns)")
+    scatter.update_yaxes(title=f"{metric_name} (ns)")
 
     box = go.Figure()
     for name, group in frequency_groups.items():
         box.add_trace(
             go.Box(
                 x=[name] * sum(record.valid for record in group),
-                y=[record.pulse_width_ns for record in group if record.valid],
+                y=[record.measurement_ns for record in group if record.valid],
                 name=name,
                 boxpoints="outliers",
             )
         )
-    box.update_layout(title="Pulse Width Distribution by Frequency", showlegend=False)
+    box.update_layout(title=f"{metric_name} Distribution by Frequency", showlegend=False)
     box.update_xaxes(title="Frequency (MHz)")
-    box.update_yaxes(title="Positive Pulse Width (ns)")
+    box.update_yaxes(title=f"{metric_name} (ns)")
 
     trend = go.Figure()
     trend_x = [
@@ -513,16 +594,16 @@ def generate_pulse_width_html_report(
             name="Median",
         )
     )
-    trend.update_layout(title="Mean and Median Pulse Width Trend")
+    trend.update_layout(title=f"Mean and Median {metric_name} Trend")
     trend.update_xaxes(title="Frequency (MHz)")
-    trend.update_yaxes(title="Positive Pulse Width (ns)")
+    trend.update_yaxes(title=f"{metric_name} (ns)")
 
     report_html = f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Positive Pulse Width Analysis Report</title>
+<title>{metric_name} Analysis Report</title>
 <script>{get_plotlyjs()}</script>
 <style>
 body {{ font-family: Arial, sans-serif; margin: 24px; color: #1f2937; }}
@@ -536,14 +617,15 @@ th:first-child, td:first-child {{ text-align: left; }}
 </style>
 </head>
 <body>
-<h1>Positive Pulse Width Analysis Report</h1>
+<h1>{metric_name} Analysis Report</h1>
 <p>Data root: <code>{html.escape(str(root.resolve()))}</code></p>
+<p><strong>Measurement Type: {measurement_display}</strong></p>
 <div class="cards">
 {_report_card("Frequency range", _frequency_range_text(frequencies))}
 {_report_card("Frequency points", str(len(statistics)))}
 {_report_card("Total samples", str(total))}
 {_report_card("Valid samples", str(valid))}
-{_report_card("Invalid PWID", f"{invalid} / {total}")}
+{_report_card(f"Invalid {measurement_display}", f"{invalid} / {total}")}
 {_report_card("Valid rate", f"{valid / total:.2%}" if total else "0.00%")}
 </div>
 <h2>Per-frequency statistics</h2>
@@ -557,6 +639,16 @@ th:first-child, td:first-child {{ text-align: left; }}
 """
     _write_text_atomic(output, report_html)
     return output
+
+
+def generate_pulse_width_html_report(
+    data_root: str | Path,
+    records: list[PulseWidthRecord],
+    statistics: list[FrequencyStatistics],
+    output_path: str | Path,
+) -> Path:
+    """Compatibility wrapper; the report itself identifies DELAY versus legacy PWID."""
+    return generate_measurement_html_report(data_root, records, statistics, output_path)
 
 
 def run_data_export(
@@ -616,9 +708,10 @@ def run_data_export(
                 )
             )
 
-    needs_records = options.pulse_width_summary or options.html_report
+    summary_requested = options.measurement_summary or options.pulse_width_summary
+    needs_records = summary_requested or options.html_report
     metadata_jobs = len(datasets) if needs_records else 0
-    summary_jobs = 2 if options.pulse_width_summary else 0
+    summary_jobs = 2 if summary_requested else 0
     report_jobs = 1 if options.html_report else 0
     total_jobs = len(file_jobs) + metadata_jobs + summary_jobs + report_jobs
     summary = ExportSummary(total=total_jobs)
@@ -662,36 +755,65 @@ def run_data_export(
             if stopped():
                 summary.stopped = True
                 return summary
-            rebuild = options.pulse_width_summary
+            rebuild = summary_requested
+            measurement_type = _dataset_measurement_type(dataset)
+            if measurement_type == "DELAY":
+                summary_filename = DELAY_SUMMARY_FILENAME
+                metric_label = "DELAY"
+            elif measurement_type == "PWID":
+                summary_filename = PULSE_WIDTH_SUMMARY_FILENAME
+                metric_label = "PWID (Legacy)"
+            else:
+                summary_filename = DELAY_SUMMARY_FILENAME
+                metric_label = "DELAY"
             label = (
-                f"Rebuild PWID summary: {dataset.directory_name}"
+                f"Rebuild {metric_label} summary: {dataset.directory_name}"
                 if rebuild
-                else f"Load PWID summary: {dataset.directory_name}"
+                else f"Load {metric_label} summary: {dataset.directory_name}"
             )
             if on_start is not None:
                 on_start(position + 1, total_jobs, label)
             try:
-                summary_path = dataset.path / PULSE_WIDTH_SUMMARY_FILENAME
+                summary_path = dataset.path / summary_filename
+                if measurement_type == "UNKNOWN":
+                    raise ValueError(
+                        "No DELAY or legacy PWID measurement metadata was found"
+                    )
                 if rebuild or not summary_path.is_file():
-                    rebuild_pulse_width_summary(dataset.path)
+                    if measurement_type == "DELAY":
+                        rebuild_delay_summary(dataset.path)
+                    else:
+                        rebuild_pulse_width_summary(dataset.path)
                 records.extend(
-                    _records_from_summary(dataset, data_root_path, summary_path)
+                    _records_from_summary(
+                        dataset,
+                        data_root_path,
+                        summary_path,
+                        measurement_type,
+                    )
                 )
             except Exception as exc:
                 report_result(label, "failed", f"{type(exc).__name__}: {exc}")
             else:
                 report_result(label, "success")
 
+    measurement_type = _measurement_type(records)
     statistics = compute_frequency_statistics(records)
-    if options.pulse_width_summary:
+    if summary_requested:
         summary_outputs: list[tuple[str, Path, Callable[[], Path]]] = []
-        all_path = output_root_path / "summary" / "pulse_width_all.csv"
-        by_frequency_path = output_root_path / "summary" / "pulse_width_by_frequency.csv"
+        file_prefix = "delay" if measurement_type == "DELAY" else "pulse_width"
+        display_label = "DELAY" if measurement_type == "DELAY" else "PWID (Legacy)"
+        all_path = output_root_path / "summary" / f"{file_prefix}_all.csv"
+        by_frequency_path = output_root_path / "summary" / f"{file_prefix}_by_frequency.csv"
         summary_outputs.extend(
             (
-                ("PWID summary: all", all_path, lambda: write_all_summary(records, all_path)),
                 (
-                    "PWID summary: by frequency",
+                    f"{display_label} summary: all",
+                    all_path,
+                    lambda: write_all_summary(records, all_path),
+                ),
+                (
+                    f"{display_label} summary: by frequency",
                     by_frequency_path,
                     lambda: write_by_frequency_summary(statistics, by_frequency_path),
                 ),
@@ -714,8 +836,10 @@ def run_data_export(
                 report_result(label, "success")
 
     if options.html_report:
-        label = "Offline HTML pulse width report"
-        destination = output_root_path / "reports" / "pulse_width_report.html"
+        legacy = measurement_type == "PWID"
+        label = "Offline HTML PWID (Legacy) report" if legacy else "Offline HTML DELAY report"
+        filename = "pulse_width_report.html" if legacy else "delay_report.html"
+        destination = output_root_path / "reports" / filename
         if stopped():
             summary.stopped = True
             return summary
@@ -725,7 +849,7 @@ def run_data_export(
             report_result(label, "skipped")
         else:
             try:
-                generate_pulse_width_html_report(
+                generate_measurement_html_report(
                     data_root_path,
                     records,
                     statistics,
@@ -742,9 +866,13 @@ def _records_from_summary(
     dataset: FrequencyDataset,
     data_root: Path,
     summary_path: Path,
+    measurement_type: str,
 ) -> list[PulseWidthRecord]:
     records: list[PulseWidthRecord] = []
-    summary_items = load_pulse_width_summary(summary_path)
+    if measurement_type == "DELAY":
+        summary_items = load_delay_summary(summary_path)
+    else:
+        summary_items = load_pulse_width_summary(summary_path)
     completed_items = [
         item
         for item in summary_items
@@ -752,23 +880,29 @@ def _records_from_summary(
         and (dataset.path / item.csv_file).is_file()
     ]
     if len(completed_items) != len(summary_items):
-        write_pulse_width_summary(summary_path, completed_items)
+        if measurement_type == "DELAY":
+            write_delay_summary(summary_path, completed_items)
+        else:
+            write_pulse_width_summary(summary_path, completed_items)
 
     for item in completed_items:
         npz_path = dataset.path / item.npz_file
         csv_path = dataset.path / item.csv_file
         records.append(
-            PulseWidthRecord(
+            MeasurementRecord(
                 frequency_mhz=dataset.frequency_mhz,
                 frequency_name=dataset.directory_name,
                 index=item.index,
-                pulse_width_s=item.pulse_width_s,
-                pulse_width_valid=item.valid,
+                measurement_s=(
+                    item.delay_s if measurement_type == "DELAY" else item.pulse_width_s
+                ),
+                measurement_valid=item.valid,
                 attempts=item.attempts,
                 raw_value=item.raw_value,
                 npz_file=_relative_path(npz_path, data_root),
                 csv_file=_relative_path(csv_path, data_root),
                 pair_status="paired",
+                measurement_type=measurement_type,
             )
         )
     return records
@@ -777,14 +911,47 @@ def _records_from_summary(
 def _summary_row(record: PulseWidthRecord) -> tuple:
     return (
         record.index,
-        _format_number(record.pulse_width_s),
-        _format_number(record.pulse_width_ns),
+        _format_number(record.measurement_s),
+        _format_number(record.measurement_ns),
         int(record.valid),
         record.attempts,
         record.raw_value,
         record.npz_file,
         record.csv_file,
     )
+
+
+def _dataset_measurement_type(dataset: FrequencyDataset) -> str:
+    """Prefer a DELAY summary and otherwise identify legacy NPZ metadata explicitly."""
+    if (dataset.path / DELAY_SUMMARY_FILENAME).is_file():
+        return "DELAY"
+    if (dataset.path / PULSE_WIDTH_SUMMARY_FILENAME).is_file():
+        return "PWID"
+    found_delay = False
+    found_pwid = False
+    for npz_path in dataset.path.glob("*.npz"):
+        if not npz_path.stem.isdigit():
+            continue
+        try:
+            with np.load(npz_path, allow_pickle=False) as data:
+                found_delay = found_delay or "delay_s" in data
+                found_pwid = found_pwid or "positive_pulse_width_s" in data
+        except Exception:
+            continue
+    if found_delay:
+        return "DELAY"
+    if found_pwid:
+        return "PWID"
+    return "UNKNOWN"
+
+
+def _measurement_type(records: list[PulseWidthRecord]) -> str:
+    types = {record.measurement_type for record in records if record.measurement_type != "UNKNOWN"}
+    if len(types) > 1:
+        raise ValueError(
+            "DELAY and legacy PWID datasets cannot be mixed in one analysis report"
+        )
+    return next(iter(types), "DELAY")
 
 
 def _write_csv_atomic(path: Path, header: tuple[str, ...], rows) -> Path:

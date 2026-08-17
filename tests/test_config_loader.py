@@ -18,14 +18,22 @@ def test_config_loads_all_timing_values(tmp_path) -> None:
                     "channel": "C2",
                     "single_timeout_sec": 12.5,
                     "trigger_poll_interval_ms": 25,
-                    "pwid_settle_delay_ms": 150,
-                    "pwid_retry_delay_ms": 300,
-                    "pwid_max_attempts": 4,
+                    "delay_settle_delay_ms": 150,
+                    "delay_retry_delay_ms": 300,
+                    "delay_max_attempts": 4,
                     "visa_timeout_ms": 45_000,
                     "chunk_size_mb": 8,
+                    "reconnect_enabled": True,
+                    "reconnect_delay_sec": 3,
+                    "reconnect_max_attempts": 6,
                 },
-                "n9020a": {"visa_timeout_ms": 7_000},
-                "pwid_delay_test": {
+                "n9020a": {
+                    "visa_timeout_ms": 7_000,
+                    "reconnect_delay_sec": 12,
+                    "reconnect_max_attempts": 4,
+                },
+                "acquisition": {"max_sample_recovery_attempts": 7},
+                "delay_measurement_test": {
                     "delays_ms": [0, 75.5],
                     "samples_per_delay": 12,
                     "inter_sample_delay_ms": 250,
@@ -41,15 +49,18 @@ def test_config_loads_all_timing_values(tmp_path) -> None:
     assert config.scope.ip == "192.0.2.44"
     assert config.scope.channel == "C2"
     assert config.scope.trigger_poll_interval_sec == pytest.approx(0.025)
-    assert config.scope.pwid_settle_delay_sec == pytest.approx(0.15)
-    assert config.scope.pwid_retry_delay_sec == pytest.approx(0.3)
-    assert config.scope.pwid_max_attempts == 4
+    assert config.scope.delay_settle_delay_sec == pytest.approx(0.15)
+    assert config.scope.delay_retry_delay_sec == pytest.approx(0.3)
+    assert config.scope.delay_max_attempts == 4
     assert config.scope.visa_timeout_ms == 45_000
     assert config.scope.chunk_size_bytes == 8 * 1024 * 1024
     assert config.n9020a.visa_timeout_ms == 7_000
-    assert config.pwid_delay_test.delays_ms == [0.0, 75.5]
-    assert config.pwid_delay_test.samples_per_delay == 12
-    assert config.pwid_delay_test.inter_sample_delay_ms == 250
+    assert config.scope.reconnect_delay_sec == 3
+    assert config.n9020a.reconnect_delay_sec == 12
+    assert config.acquisition.max_sample_recovery_attempts == 7
+    assert config.delay_measurement_test.delays_ms == [0.0, 75.5]
+    assert config.delay_measurement_test.samples_per_delay == 12
+    assert config.delay_measurement_test.inter_sample_delay_ms == 250
 
 
 def test_missing_fields_use_defaults(tmp_path) -> None:
@@ -61,9 +72,9 @@ def test_missing_fields_use_defaults(tmp_path) -> None:
     defaults = AppConfig()
     assert config.scope.single_timeout_sec == 10
     assert config.scope.trigger_poll_interval_ms == defaults.scope.trigger_poll_interval_ms
-    assert config.scope.pwid_max_attempts == 3
+    assert config.scope.delay_max_attempts == 3
     assert config.n9020a == defaults.n9020a
-    assert config.pwid_delay_test == defaults.pwid_delay_test
+    assert config.delay_measurement_test == defaults.delay_measurement_test
 
 
 def test_missing_file_uses_defaults_and_can_generate_config(tmp_path) -> None:
@@ -73,7 +84,9 @@ def test_missing_file_uses_defaults_and_can_generate_config(tmp_path) -> None:
 
     assert config == AppConfig()
     assert path.is_file()
-    assert json.loads(path.read_text(encoding="utf-8"))["scope"]["pwid_max_attempts"] == 3
+    generated = json.loads(path.read_text(encoding="utf-8"))
+    assert generated["scope"]["delay_max_attempts"] == 3
+    assert "pwid_max_attempts" not in generated["scope"]
 
 
 def test_packaged_app_prefers_config_beside_executable(monkeypatch, tmp_path) -> None:
@@ -82,11 +95,11 @@ def test_packaged_app_prefers_config_beside_executable(monkeypatch, tmp_path) ->
     exe_dir.mkdir()
     working_dir.mkdir()
     (exe_dir / "config.json").write_text(
-        '{"scope": {"pwid_settle_delay_ms": 111}}',
+        '{"scope": {"delay_settle_delay_ms": 111}}',
         encoding="utf-8",
     )
     (working_dir / "config.json").write_text(
-        '{"scope": {"pwid_settle_delay_ms": 222}}',
+        '{"scope": {"delay_settle_delay_ms": 222}}',
         encoding="utf-8",
     )
     monkeypatch.setattr(config_loader.sys, "frozen", True, raising=False)
@@ -95,7 +108,7 @@ def test_packaged_app_prefers_config_beside_executable(monkeypatch, tmp_path) ->
 
     config = load_config()
 
-    assert config.scope.pwid_settle_delay_ms == 111
+    assert config.scope.delay_settle_delay_ms == 111
     assert config_loader.config_search_paths()[0] == (exe_dir / "config.json").resolve()
 
 
@@ -105,10 +118,10 @@ def test_packaged_app_prefers_config_beside_executable(monkeypatch, tmp_path) ->
         ("{broken", "Invalid JSON"),
         ('{"scope": {"single_timeout_sec": 0}}', "single_timeout_sec"),
         ('{"scope": {"trigger_poll_interval_ms": 0}}', "trigger_poll_interval_ms"),
-        ('{"scope": {"pwid_max_attempts": 11}}', "pwid_max_attempts"),
+        ('{"scope": {"delay_max_attempts": 11}}', "delay_max_attempts"),
         ('{"scope": {"channel": "C5"}}', "scope.channel"),
-        ('{"pwid_delay_test": {"delays_ms": [-1]}}', "delays_ms"),
-        ('{"pwid_delay_test": {"samples_per_delay": 0}}', "samples_per_delay"),
+        ('{"delay_measurement_test": {"delays_ms": [-1]}}', "delays_ms"),
+        ('{"delay_measurement_test": {"samples_per_delay": 0}}', "samples_per_delay"),
     ],
 )
 def test_invalid_config_is_rejected(tmp_path, content: str, message: str) -> None:
@@ -117,3 +130,26 @@ def test_invalid_config_is_rejected(tmp_path, content: str, message: str) -> Non
 
     with pytest.raises(ConfigError, match=message):
         load_config(path)
+
+
+def test_legacy_pwid_fields_map_to_delay_and_new_fields_win(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "scope": {
+                    "pwid_settle_delay_ms": 999,
+                    "delay_settle_delay_ms": 123,
+                    "pwid_retry_delay_ms": 456,
+                    "pwid_max_attempts": 4,
+                },
+                "pwid_delay_test": {"samples_per_delay": 9},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    assert config.scope.delay_settle_delay_ms == 123
+    assert config.scope.delay_retry_delay_ms == 456
+    assert config.scope.delay_max_attempts == 4
+    assert config.delay_measurement_test.samples_per_delay == 9

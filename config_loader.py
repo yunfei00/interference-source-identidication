@@ -22,23 +22,26 @@ class ScopeTimingConfig:
     channel: str = "C1"
     single_timeout_sec: float = 30.0
     trigger_poll_interval_ms: int = 50
-    pwid_settle_delay_ms: int = 200
-    pwid_retry_delay_ms: int = 200
-    pwid_max_attempts: int = 3
+    delay_settle_delay_ms: int = 200
+    delay_retry_delay_ms: int = 200
+    delay_max_attempts: int = 3
     visa_timeout_ms: int = 60_000
     chunk_size_mb: int = 20
+    reconnect_enabled: bool = True
+    reconnect_delay_sec: float = 2.0
+    reconnect_max_attempts: int = 5
 
     @property
     def trigger_poll_interval_sec(self) -> float:
         return self.trigger_poll_interval_ms / 1000.0
 
     @property
-    def pwid_settle_delay_sec(self) -> float:
-        return self.pwid_settle_delay_ms / 1000.0
+    def delay_settle_delay_sec(self) -> float:
+        return self.delay_settle_delay_ms / 1000.0
 
     @property
-    def pwid_retry_delay_sec(self) -> float:
-        return self.pwid_retry_delay_ms / 1000.0
+    def delay_retry_delay_sec(self) -> float:
+        return self.delay_retry_delay_ms / 1000.0
 
     @property
     def chunk_size_bytes(self) -> int:
@@ -48,10 +51,13 @@ class ScopeTimingConfig:
 @dataclass(frozen=True)
 class N9020ATimingConfig:
     visa_timeout_ms: int = 5_000
+    reconnect_enabled: bool = True
+    reconnect_delay_sec: float = 15.0
+    reconnect_max_attempts: int = 5
 
 
 @dataclass(frozen=True)
-class PWIDDelayTestConfig:
+class DelayMeasurementTestConfig:
     delays_ms: list[float] = field(
         default_factory=lambda: [0, 50, 100, 150, 200, 300, 500]
     )
@@ -60,12 +66,18 @@ class PWIDDelayTestConfig:
 
 
 @dataclass(frozen=True)
+class AcquisitionRecoveryConfig:
+    max_sample_recovery_attempts: int = 5
+
+
+@dataclass(frozen=True)
 class AppConfig:
     scope: ScopeTimingConfig = field(default_factory=ScopeTimingConfig)
     n9020a: N9020ATimingConfig = field(default_factory=N9020ATimingConfig)
-    pwid_delay_test: PWIDDelayTestConfig = field(default_factory=PWIDDelayTestConfig)
-
-
+    acquisition: AcquisitionRecoveryConfig = field(default_factory=AcquisitionRecoveryConfig)
+    delay_measurement_test: DelayMeasurementTestConfig = field(
+        default_factory=DelayMeasurementTestConfig
+    )
 def load_config(
     path: str | Path | None = None,
     *,
@@ -92,7 +104,14 @@ def load_config(
 
     scope_raw = _section(raw, "scope", config_path)
     n9020a_raw = _section(raw, "n9020a", config_path)
-    delay_test_raw = _section(raw, "pwid_delay_test", config_path)
+    acquisition_raw = _section(raw, "acquisition", config_path)
+    delay_test_raw = _section(
+        raw,
+        "delay_measurement_test"
+        if "delay_measurement_test" in raw
+        else "pwid_delay_test",
+        config_path,
+    )
 
     scope = ScopeTimingConfig(
         ip=_string(scope_raw, "ip", defaults.scope.ip, config_path),
@@ -109,23 +128,17 @@ def load_config(
             defaults.scope.trigger_poll_interval_ms,
             config_path,
         ),
-        pwid_settle_delay_ms=_integer(
-            scope_raw,
-            "pwid_settle_delay_ms",
-            defaults.scope.pwid_settle_delay_ms,
-            config_path,
+        delay_settle_delay_ms=_integer_with_legacy(
+            scope_raw, "delay_settle_delay_ms", "pwid_settle_delay_ms",
+            defaults.scope.delay_settle_delay_ms, config_path,
         ),
-        pwid_retry_delay_ms=_integer(
-            scope_raw,
-            "pwid_retry_delay_ms",
-            defaults.scope.pwid_retry_delay_ms,
-            config_path,
+        delay_retry_delay_ms=_integer_with_legacy(
+            scope_raw, "delay_retry_delay_ms", "pwid_retry_delay_ms",
+            defaults.scope.delay_retry_delay_ms, config_path,
         ),
-        pwid_max_attempts=_integer(
-            scope_raw,
-            "pwid_max_attempts",
-            defaults.scope.pwid_max_attempts,
-            config_path,
+        delay_max_attempts=_integer_with_legacy(
+            scope_raw, "delay_max_attempts", "pwid_max_attempts",
+            defaults.scope.delay_max_attempts, config_path,
         ),
         visa_timeout_ms=_integer(
             scope_raw,
@@ -139,6 +152,16 @@ def load_config(
             defaults.scope.chunk_size_mb,
             config_path,
         ),
+        reconnect_enabled=_boolean(
+            scope_raw, "reconnect_enabled", defaults.scope.reconnect_enabled, config_path
+        ),
+        reconnect_delay_sec=_number(
+            scope_raw, "reconnect_delay_sec", defaults.scope.reconnect_delay_sec, config_path
+        ),
+        reconnect_max_attempts=_integer(
+            scope_raw, "reconnect_max_attempts", defaults.scope.reconnect_max_attempts,
+            config_path,
+        ),
     )
     n9020a = N9020ATimingConfig(
         visa_timeout_ms=_integer(
@@ -146,29 +169,52 @@ def load_config(
             "visa_timeout_ms",
             defaults.n9020a.visa_timeout_ms,
             config_path,
+        ),
+        reconnect_enabled=_boolean(
+            n9020a_raw, "reconnect_enabled", defaults.n9020a.reconnect_enabled, config_path
+        ),
+        reconnect_delay_sec=_number(
+            n9020a_raw, "reconnect_delay_sec", defaults.n9020a.reconnect_delay_sec, config_path
+        ),
+        reconnect_max_attempts=_integer(
+            n9020a_raw, "reconnect_max_attempts", defaults.n9020a.reconnect_max_attempts,
+            config_path,
+        ),
+    )
+    acquisition = AcquisitionRecoveryConfig(
+        max_sample_recovery_attempts=_integer(
+            acquisition_raw,
+            "max_sample_recovery_attempts",
+            defaults.acquisition.max_sample_recovery_attempts,
+            config_path,
         )
     )
-    delay_test = PWIDDelayTestConfig(
+    delay_test = DelayMeasurementTestConfig(
         delays_ms=_number_list(
             delay_test_raw,
             "delays_ms",
-            defaults.pwid_delay_test.delays_ms,
+            defaults.delay_measurement_test.delays_ms,
             config_path,
         ),
         samples_per_delay=_integer(
             delay_test_raw,
             "samples_per_delay",
-            defaults.pwid_delay_test.samples_per_delay,
+            defaults.delay_measurement_test.samples_per_delay,
             config_path,
         ),
         inter_sample_delay_ms=_integer(
             delay_test_raw,
             "inter_sample_delay_ms",
-            defaults.pwid_delay_test.inter_sample_delay_ms,
+            defaults.delay_measurement_test.inter_sample_delay_ms,
             config_path,
         ),
     )
-    config = AppConfig(scope=scope, n9020a=n9020a, pwid_delay_test=delay_test)
+    config = AppConfig(
+        scope=scope,
+        n9020a=n9020a,
+        acquisition=acquisition,
+        delay_measurement_test=delay_test,
+    )
     _validate(config, config_path)
     return config
 
@@ -240,6 +286,24 @@ def _integer(section: dict[str, Any], key: str, default: int, path: Path) -> int
     return value
 
 
+def _integer_with_legacy(
+    section: dict[str, Any],
+    key: str,
+    legacy_key: str,
+    default: int,
+    path: Path,
+) -> int:
+    selected_key = key if key in section else legacy_key if legacy_key in section else key
+    return _integer(section, selected_key, default, path)
+
+
+def _boolean(section: dict[str, Any], key: str, default: bool, path: Path) -> bool:
+    value = section.get(key, default)
+    if not isinstance(value, bool):
+        raise ConfigError(f"Invalid config in {path}: '{key}' must be a boolean")
+    return value
+
+
 def _number_list(
     section: dict[str, Any],
     key: str,
@@ -274,34 +338,51 @@ def _validate(config: AppConfig, path: Path) -> None:
             "scope.trigger_poll_interval_ms must be >= 1",
         ),
         (
-            scope.pwid_settle_delay_ms >= 0,
-            "scope.pwid_settle_delay_ms must be >= 0",
+            scope.delay_settle_delay_ms >= 0,
+            "scope.delay_settle_delay_ms must be >= 0",
         ),
         (
-            scope.pwid_retry_delay_ms >= 0,
-            "scope.pwid_retry_delay_ms must be >= 0",
+            scope.delay_retry_delay_ms >= 0,
+            "scope.delay_retry_delay_ms must be >= 0",
         ),
         (
-            1 <= scope.pwid_max_attempts <= 10,
-            "scope.pwid_max_attempts must be between 1 and 10",
+            1 <= scope.delay_max_attempts <= 10,
+            "scope.delay_max_attempts must be between 1 and 10",
         ),
         (scope.visa_timeout_ms > 0, "scope.visa_timeout_ms must be > 0"),
         (scope.chunk_size_mb > 0, "scope.chunk_size_mb must be > 0"),
+        (scope.reconnect_delay_sec >= 0, "scope.reconnect_delay_sec must be >= 0"),
+        (
+            1 <= scope.reconnect_max_attempts <= 100,
+            "scope.reconnect_max_attempts must be between 1 and 100",
+        ),
         (
             config.n9020a.visa_timeout_ms > 0,
             "n9020a.visa_timeout_ms must be > 0",
         ),
         (
-            config.pwid_delay_test.samples_per_delay >= 1,
-            "pwid_delay_test.samples_per_delay must be >= 1",
+            config.n9020a.reconnect_delay_sec >= 0,
+            "n9020a.reconnect_delay_sec must be >= 0",
         ),
         (
-            config.pwid_delay_test.inter_sample_delay_ms >= 0,
-            "pwid_delay_test.inter_sample_delay_ms must be >= 0",
+            1 <= config.n9020a.reconnect_max_attempts <= 100,
+            "n9020a.reconnect_max_attempts must be between 1 and 100",
         ),
         (
-            all(delay >= 0 for delay in config.pwid_delay_test.delays_ms),
-            "pwid_delay_test.delays_ms values must be >= 0",
+            1 <= config.acquisition.max_sample_recovery_attempts <= 100,
+            "acquisition.max_sample_recovery_attempts must be between 1 and 100",
+        ),
+        (
+            config.delay_measurement_test.samples_per_delay >= 1,
+            "delay_measurement_test.samples_per_delay must be >= 1",
+        ),
+        (
+            config.delay_measurement_test.inter_sample_delay_ms >= 0,
+            "delay_measurement_test.inter_sample_delay_ms must be >= 0",
+        ),
+        (
+            all(delay >= 0 for delay in config.delay_measurement_test.delays_ms),
+            "delay_measurement_test.delays_ms values must be >= 0",
         ),
     )
     for valid, message in checks:

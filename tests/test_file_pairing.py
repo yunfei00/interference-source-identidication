@@ -6,8 +6,8 @@ import numpy as np
 
 from acquisition_worker import AcquisitionWorker, CaptureRequest
 from file_pairing import is_capture_complete, next_capture_index
-from pulse_width_summary import load_pulse_width_summary
-from sds3104xhd_client import PulseWidthAcquisitionResult
+from delay_summary import load_delay_summary
+from sds3104xhd_client import DelayAcquisitionResult
 
 
 def _touch(folder: Path, name: str) -> None:
@@ -70,15 +70,15 @@ class _FakeScope:
     def __init__(self, fail_save: bool = False) -> None:
         self.fail_save = fail_save
 
-    def acquire_single_with_pwid_retry(
+    def acquire_single_with_delay_retry(
         self,
         *,
         capture_index: int,
         should_stop,
-    ) -> PulseWidthAcquisitionResult:
+    ) -> DelayAcquisitionResult:
         assert capture_index >= 1
         assert not should_stop()
-        return PulseWidthAcquisitionResult(1.25e-7, "1.25E-07", True, 1, 0.1)
+        return DelayAcquisitionResult(1.25e-7, "1.25E-07", True, 1, 0.1)
 
     def read_waveform(self) -> _FakeWaveform:
         return _FakeWaveform()
@@ -88,29 +88,21 @@ class _FakeScope:
         path: Path,
         _waveform: _FakeWaveform,
         index: int,
-        positive_pulse_width_s: float,
+        delay_s: float,
         *,
-        positive_pulse_width_raw: str,
-        positive_pulse_width_valid: bool,
-        positive_pulse_width_attempts: int,
+        delay_raw: str,
+        delay_valid: bool,
+        delay_attempts: int,
     ) -> None:
         with path.open("wb") as output_file:
             np.savez(
                 output_file,
                 index=np.asarray(index, dtype=np.int32),
-                positive_pulse_width_s=np.asarray(
-                    positive_pulse_width_s,
-                    dtype=np.float64,
-                ),
-                positive_pulse_width_raw=np.asarray(positive_pulse_width_raw),
-                positive_pulse_width_valid=np.asarray(
-                    positive_pulse_width_valid,
-                    dtype=np.bool_,
-                ),
-                positive_pulse_width_attempts=np.asarray(
-                    positive_pulse_width_attempts,
-                    dtype=np.int32,
-                ),
+                delay_s=np.asarray(delay_s, dtype=np.float64),
+                delay_raw=np.asarray(delay_raw),
+                delay_valid=np.asarray(delay_valid, dtype=np.bool_),
+                delay_attempts=np.asarray(delay_attempts, dtype=np.int32),
+                advanced_measurement_type=np.asarray("DELAY"),
             )
         if self.fail_save:
             raise OSError("simulated NPZ save error")
@@ -131,7 +123,7 @@ def test_worker_commits_csv_and_npz_pair(tmp_path: Path) -> None:
     assert len(results) == 1
     assert (tmp_path / "000001.csv").is_file()
     assert (tmp_path / "000001.npz").is_file()
-    summary = load_pulse_width_summary(tmp_path / "pulse_width_summary.csv")
+    summary = load_delay_summary(tmp_path / "delay_summary.csv")
     assert len(summary) == 1
     assert summary[0].index == 1
     assert summary[0].attempts == 1
@@ -152,7 +144,7 @@ def test_worker_save_failure_cleans_tmp_and_formal_files(tmp_path: Path) -> None
     assert next_capture_index(tmp_path, scope_enabled=True) == 1
 
 
-def test_worker_reads_pwid_after_single_and_before_waveform(tmp_path: Path) -> None:
+def test_worker_reads_delay_after_single_and_before_waveform(tmp_path: Path) -> None:
     events: list[str] = []
 
     class OrderedN9020A(_FakeN9020A):
@@ -161,15 +153,15 @@ def test_worker_reads_pwid_after_single_and_before_waveform(tmp_path: Path) -> N
             return super().fetch_csv_text()
 
     class OrderedScope(_FakeScope):
-        def acquire_single_with_pwid_retry(
+        def acquire_single_with_delay_retry(
             self,
             *,
             capture_index: int,
             should_stop,
-        ) -> PulseWidthAcquisitionResult:
+        ) -> DelayAcquisitionResult:
             events.append("single")
-            events.append("pwid")
-            return super().acquire_single_with_pwid_retry(
+            events.append("delay")
+            return super().acquire_single_with_delay_retry(
                 capture_index=capture_index,
                 should_stop=should_stop,
             )
@@ -183,11 +175,11 @@ def test_worker_reads_pwid_after_single_and_before_waveform(tmp_path: Path) -> N
             path: Path,
             waveform: _FakeWaveform,
             index: int,
-            pulse_width: float,
+            delay_s: float,
             **metadata,
         ) -> None:
             events.append("save_npz")
-            super().save_npz(path, waveform, index, pulse_width, **metadata)
+            super().save_npz(path, waveform, index, delay_s, **metadata)
 
     worker = AcquisitionWorker(
         OrderedN9020A(),
@@ -197,22 +189,22 @@ def test_worker_reads_pwid_after_single_and_before_waveform(tmp_path: Path) -> N
 
     worker.capture_one()
 
-    assert events == ["single", "pwid", "n9020a_csv", "waveform", "save_npz"]
+    assert events == ["single", "delay", "n9020a_csv", "waveform", "save_npz"]
 
 
-def test_unavailable_pwid_does_not_fail_capture_pair(tmp_path: Path) -> None:
-    class UnavailablePWIDScope(_FakeScope):
-        def acquire_single_with_pwid_retry(
+def test_unavailable_delay_does_not_fail_capture_pair(tmp_path: Path) -> None:
+    class UnavailableDelayScope(_FakeScope):
+        def acquire_single_with_delay_retry(
             self,
             *,
             capture_index: int,
             should_stop,
-        ) -> PulseWidthAcquisitionResult:
-            return PulseWidthAcquisitionResult(float("nan"), "****", False, 5, 0.1)
+        ) -> DelayAcquisitionResult:
+            return DelayAcquisitionResult(float("nan"), "****", False, 5, 0.1)
 
     worker = AcquisitionWorker(
         _FakeN9020A(),
-        UnavailablePWIDScope(),
+        UnavailableDelayScope(),
         CaptureRequest(tmp_path, index=1, scope_enabled=True),
     )  # type: ignore[arg-type]
     errors: list[str] = []
@@ -222,13 +214,13 @@ def test_unavailable_pwid_does_not_fail_capture_pair(tmp_path: Path) -> None:
 
     assert not errors
     assert is_capture_complete(tmp_path, 1, scope_enabled=True)
-    summary = load_pulse_width_summary(tmp_path / "pulse_width_summary.csv")
+    summary = load_delay_summary(tmp_path / "delay_summary.csv")
     assert summary[0].valid is False
     assert summary[0].attempts == 5
     assert summary[0].raw_value == "****"
 
 
-def test_worker_reads_waveform_from_last_pwid_attempt(tmp_path: Path) -> None:
+def test_worker_reads_waveform_from_last_delay_attempt(tmp_path: Path) -> None:
     saved: dict[str, object] = {}
 
     class FiveAttemptScope(_FakeScope):
@@ -236,15 +228,15 @@ def test_worker_reads_waveform_from_last_pwid_attempt(tmp_path: Path) -> None:
             super().__init__()
             self.frame = 0
 
-        def acquire_single_with_pwid_retry(
+        def acquire_single_with_delay_retry(
             self,
             *,
             capture_index: int,
             should_stop,
-        ) -> PulseWidthAcquisitionResult:
+        ) -> DelayAcquisitionResult:
             for _attempt in range(5):
                 self.frame += 1
-            return PulseWidthAcquisitionResult(float("nan"), "****", False, 5, 0.5)
+            return DelayAcquisitionResult(float("nan"), "****", False, 5, 0.5)
 
         def read_waveform(self) -> _FakeWaveform:
             return _FakeWaveform(self.frame)
@@ -254,16 +246,16 @@ def test_worker_reads_waveform_from_last_pwid_attempt(tmp_path: Path) -> None:
             path: Path,
             waveform: _FakeWaveform,
             index: int,
-            positive_pulse_width_s: float,
+            delay_s: float,
             **metadata,
         ) -> None:
             saved["frame"] = waveform.frame
-            saved["attempts"] = metadata["positive_pulse_width_attempts"]
+            saved["attempts"] = metadata["delay_attempts"]
             super().save_npz(
                 path,
                 waveform,
                 index,
-                positive_pulse_width_s,
+                delay_s,
                 **metadata,
             )
 

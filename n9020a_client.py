@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from instrument_errors import N9020ACommunicationError, is_communication_exception
+
 
 @dataclass
 class N9020AConfig:
     resource: str
     timeout_ms: int
     remote_csv_path: str = r"D:\\data.csv"
+    reconnect_enabled: bool = True
+    reconnect_delay_sec: float = 15.0
+    reconnect_max_attempts: int = 5
 
 
 class N9020AClient:
@@ -17,18 +22,20 @@ class N9020AClient:
         self.config = config
         self._rm = None
         self._inst = None
+        self._idn = ""
 
     def connect(self) -> None:
         import pyvisa
 
-        self._rm = pyvisa.ResourceManager()
         try:
+            self._rm = pyvisa.ResourceManager()
             self._inst = self._rm.open_resource(self.config.resource)
             self._inst.timeout = self.config.timeout_ms
-            # Optional sanity check
-            _ = self.query("*IDN?")
-        except Exception:
+            self._idn = self.query("*IDN?")
+        except Exception as exc:
             self.disconnect()
+            if is_communication_exception(exc):
+                raise N9020ACommunicationError("connect/*IDN?", exc) from exc
             raise
 
     def disconnect(self) -> None:
@@ -46,16 +53,36 @@ class N9020AClient:
                 pass
             finally:
                 self._rm = None
+        self._idn = ""
+
+    def is_connected(self) -> bool:
+        return self._inst is not None
+
+    def reconnect(self) -> str:
+        """Create a fresh VISA session and return the verified identity string."""
+        self.disconnect()
+        self.connect()
+        return self._idn
 
     def write(self, cmd: str) -> None:
         if self._inst is None:
-            raise RuntimeError("Instrument not connected")
-        self._inst.write(cmd)
+            raise N9020ACommunicationError(cmd, "Instrument not connected")
+        try:
+            self._inst.write(cmd)
+        except Exception as exc:
+            if is_communication_exception(exc):
+                raise N9020ACommunicationError(cmd, exc) from exc
+            raise
 
     def query(self, cmd: str) -> str:
         if self._inst is None:
-            raise RuntimeError("Instrument not connected")
-        return str(self._inst.query(cmd)).strip()
+            raise N9020ACommunicationError(cmd, "Instrument not connected")
+        try:
+            return str(self._inst.query(cmd)).strip()
+        except Exception as exc:
+            if is_communication_exception(exc):
+                raise N9020ACommunicationError(cmd, exc) from exc
+            raise
 
     def fetch_csv_text(self) -> str:
         """Fetch measurement as CSV text from instrument memory.
@@ -68,7 +95,7 @@ class N9020AClient:
         5) Read file back via MMEM:DATA?.
         """
         if self._inst is None:
-            raise RuntimeError("Instrument not connected")
+            raise N9020ACommunicationError("fetch_csv_text", "Instrument not connected")
 
         remote_path = self.config.remote_csv_path
         self.write(":INIT:CONT OFF")
@@ -79,7 +106,7 @@ class N9020AClient:
         self.write(f'MMEM:STOR:TRAC:DATA TRACE1, "{remote_path}"')
         raw = self.query(f':MMEM:DATA? "{remote_path}"')
         if not raw:
-            raise RuntimeError("Empty data returned from instrument")
+            raise N9020ACommunicationError("MMEM:DATA?", "empty data returned")
 
         # Readback succeeded; delete temporary file on the instrument.
         self.write(f'MMEM:DEL "{remote_path}"')
@@ -90,6 +117,8 @@ class N9020AClient:
 
     def set_center_and_span_mhz(self, center_mhz: float, span_mhz: float) -> None:
         if self._inst is None:
-            raise RuntimeError("Instrument not connected")
+            raise N9020ACommunicationError(
+                "set_center_and_span_mhz", "Instrument not connected"
+            )
         self.write(f":FREQ:CENT {center_mhz} MHz")
         self.write(f":FREQ:SPAN {span_mhz} MHz")

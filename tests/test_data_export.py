@@ -42,6 +42,21 @@ def _write_n9020a_csv(path: Path) -> None:
     )
 
 
+def _write_delay_npz(path: Path, delay_s: float = 1.0e-7) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        path,
+        time_s=np.asarray([-1e-6, 0, 1e-6], dtype=np.float64),
+        voltage_v=np.asarray([-1, 0, 1], dtype=np.float32),
+        adc=np.asarray([-1, 0, 1], dtype=np.int16),
+        delay_s=np.asarray(delay_s, dtype=np.float64),
+        delay_raw=np.asarray(f"{delay_s:.4E}"),
+        delay_valid=np.asarray(True, dtype=np.bool_),
+        delay_attempts=np.asarray(2, dtype=np.int32),
+        advanced_measurement_type=np.asarray("DELAY"),
+    )
+
+
 @pytest.mark.parametrize(
     ("directory_name", "expected"),
     [
@@ -239,3 +254,46 @@ def test_html_export_prefers_existing_summary_over_loading_npz(tmp_path: Path) -
 
     assert html.failed == 0
     assert (data_root / "html-export" / "reports" / "pulse_width_report.html").is_file()
+
+
+def test_delay_export_uses_new_summary_names_and_report_wording(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    folder = data_root / "600MHz"
+    _write_n9020a_csv(folder / "000001.csv")
+    _write_delay_npz(folder / "000001.npz", 134.47e-9)
+    output_root = data_root / "export"
+
+    result = run_data_export(
+        data_root,
+        output_root,
+        ExportOptions(measurement_summary=True, html_report=True),
+    )
+
+    assert result.failed == 0
+    assert (folder / "delay_summary.csv").is_file()
+    all_summary = output_root / "summary" / "delay_all.csv"
+    report_path = output_root / "reports" / "delay_report.html"
+    assert all_summary.is_file() and report_path.is_file()
+    with all_summary.open(encoding="utf-8-sig", newline="") as source:
+        row = next(csv.DictReader(source))
+    assert float(row["delay_ns"]) == pytest.approx(134.47)
+    report = report_path.read_text(encoding="utf-8")
+    assert "Measurement Type: DELAY" in report
+    assert "Delay Distribution" in report
+
+
+def test_legacy_report_is_explicitly_labeled_and_not_mixed_with_delay(tmp_path: Path) -> None:
+    legacy_root = tmp_path / "legacy"
+    legacy_folder = legacy_root / "600MHz"
+    _write_n9020a_csv(legacy_folder / "000001.csv")
+    _write_npz(legacy_folder / "000001.npz", 100e-9)
+    result = run_data_export(
+        legacy_root,
+        legacy_root / "export",
+        ExportOptions(html_report=True),
+    )
+    assert result.failed == 0
+    report = (legacy_root / "export" / "reports" / "pulse_width_report.html").read_text(
+        encoding="utf-8"
+    )
+    assert "Measurement Type: PWID (Legacy)" in report

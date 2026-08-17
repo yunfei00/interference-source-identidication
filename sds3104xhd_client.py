@@ -11,6 +11,7 @@ from typing import Callable
 
 import numpy as np
 
+from instrument_errors import ScopeCommunicationError, is_communication_exception
 from time_formatting import format_time_value
 
 
@@ -72,9 +73,12 @@ class SDS3104XHDConfig:
     single_timeout_sec: float
     chunk_size: int
     trigger_poll_interval_sec: float
-    pwid_settle_delay_sec: float
-    pwid_retry_delay_sec: float
-    pwid_max_attempts: int
+    delay_settle_delay_sec: float
+    delay_retry_delay_sec: float
+    delay_max_attempts: int
+    reconnect_enabled: bool = True
+    reconnect_delay_sec: float = 2.0
+    reconnect_max_attempts: int = 5
 
 
 @dataclass(frozen=True)
@@ -118,10 +122,10 @@ class ScopeWaveform:
 
 
 @dataclass(frozen=True)
-class PulseWidthAcquisitionResult:
-    pulse_width_s: float
-    pulse_width_raw: str
-    pulse_width_valid: bool
+class DelayAcquisitionResult:
+    delay_s: float
+    delay_raw: str
+    delay_valid: bool
     attempts: int
     single_seconds: float
 
@@ -226,8 +230,8 @@ def convert_adc_to_voltage(
     )
 
 
-def parse_positive_pulse_width(raw: object) -> float:
-    """Parse a PWID response, returning NaN for unavailable measurements."""
+def parse_delay_value(raw: object) -> float:
+    """Parse a DELAY response, returning NaN for unavailable measurements."""
     if raw is None:
         return float("nan")
     text = str(raw).strip()
@@ -256,15 +260,17 @@ class SDS3104XHDClient:
     def connect(self) -> None:
         import pyvisa
 
-        self._rm = pyvisa.ResourceManager()
         try:
+            self._rm = pyvisa.ResourceManager()
             self._inst = self._rm.open_resource(self.resource)
             self._inst.timeout = self.config.timeout_ms
             self._inst.chunk_size = self.config.chunk_size
             self._idn = self.identify()
-            self.configure_positive_pulse_width()
-        except Exception:
+            self.configure_delay_measurement()
+        except Exception as exc:
             self.disconnect()
+            if is_communication_exception(exc):
+                raise ScopeCommunicationError("connect/*IDN?", exc) from exc
             raise
 
     def disconnect(self) -> None:
@@ -287,27 +293,37 @@ class SDS3104XHDClient:
     def identify(self) -> str:
         return self.query("*IDN?")
 
-    def configure_positive_pulse_width(self) -> None:
-        """Configure advanced measurement P1 as positive pulse width."""
-        self.write("MEAS:ADV:P1:TYPE PWID")
+    def is_connected(self) -> bool:
+        return self._inst is not None
 
-    def read_positive_pulse_width(self, capture_index: int | None = None) -> float:
+    def reconnect(self) -> str:
+        """Create a fresh VISA session and return the verified identity string."""
+        self.disconnect()
+        self.connect()
+        return self._idn
+
+    def configure_delay_measurement(self) -> None:
+        """Configure advanced measurement P1 as DELAY."""
+        self.write("MEAS:ADV:P1:TYPE DELAY")
+        logger.info("[SDS3104XHD] advanced measurement configured: DELAY")
+
+    def read_delay_value(self, capture_index: int | None = None) -> float:
         """Read P1 in seconds; invalid values become NaN and I/O errors propagate."""
         prefix = f"[{capture_index:06d}] " if capture_index is not None else ""
         raw = self.query("MEAS:ADV:P1:VAL?").strip()
-        value = parse_positive_pulse_width(raw)
+        value = parse_delay_value(raw)
         if math.isnan(value):
-            logger.warning("%sPWID unavailable: %s", prefix, raw or "<empty>")
+            logger.warning("%s[SDS3104XHD] DELAY unavailable: %s", prefix, raw or "<empty>")
         return value
 
-    def acquire_single_with_pwid_retry(
+    def acquire_single_with_delay_retry(
         self,
         *,
         capture_index: int | None = None,
         should_stop: Callable[[], bool] | None = None,
-    ) -> PulseWidthAcquisitionResult:
-        """Acquire fresh Single frames until PWID is valid or attempts are exhausted."""
-        attempt_limit = self.config.pwid_max_attempts
+    ) -> DelayAcquisitionResult:
+        """Acquire fresh Single frames until DELAY is valid or attempts are exhausted."""
+        attempt_limit = self.config.delay_max_attempts
         if attempt_limit < 1:
             raise ValueError("max_attempts must be at least 1")
 
@@ -319,14 +335,14 @@ class SDS3104XHDClient:
                 raise AcquisitionStopped("Capture stopped before Scope Single")
 
             logger.info(
-                "%sScope Single attempt %d/%d",
+                "%s[SDS3104XHD] Scope Single attempt %d/%d",
                 prefix,
                 attempt,
                 attempt_limit,
             )
             last_single_seconds = self.acquire_single()
             logger.info(
-                "%sTrigger STOP after %.1f ms",
+                "%s[SDS3104XHD] Trigger STOP after %.1f ms",
                 prefix,
                 last_single_seconds * 1000.0,
             )
@@ -335,47 +351,49 @@ class SDS3104XHDClient:
                 raise AcquisitionStopped("Capture stopped after Scope Single")
 
             logger.info(
-                "%sWaiting %.1f ms before PWID query",
+                "%s[SDS3104XHD] waiting %.1f ms before DELAY query",
                 prefix,
-                self.config.pwid_settle_delay_sec * 1000.0,
+                self.config.delay_settle_delay_sec * 1000.0,
             )
-            self._sleep_interruptibly(self.config.pwid_settle_delay_sec, should_stop)
+            self._sleep_interruptibly(self.config.delay_settle_delay_sec, should_stop)
 
             # Query errors are communication failures and must follow the device error path.
             last_raw = self.query("MEAS:ADV:P1:VAL?").strip()
-            pulse_width_s = parse_positive_pulse_width(last_raw)
-            if math.isfinite(pulse_width_s):
+            delay_s = parse_delay_value(last_raw)
+            if math.isfinite(delay_s):
                 logger.info(
-                    "%sPWID = %s",
+                    "%s[SDS3104XHD] DELAY = %s",
                     prefix,
-                    format_time_value(pulse_width_s),
+                    format_time_value(delay_s),
                 )
-                return PulseWidthAcquisitionResult(
-                    pulse_width_s=pulse_width_s,
-                    pulse_width_raw=last_raw,
-                    pulse_width_valid=True,
+                return DelayAcquisitionResult(
+                    delay_s=delay_s,
+                    delay_raw=last_raw,
+                    delay_valid=True,
                     attempts=attempt,
                     single_seconds=last_single_seconds,
                 )
 
-            logger.warning("%sPWID unavailable: %s", prefix, last_raw or "<empty>")
+            logger.warning(
+                "%s[SDS3104XHD] DELAY unavailable: %s", prefix, last_raw or "<empty>"
+            )
             if attempt < attempt_limit:
                 logger.info(
-                    "%sWaiting %.1f ms before retry",
+                    "%s[SDS3104XHD] waiting %.1f ms before DELAY retry",
                     prefix,
-                    self.config.pwid_retry_delay_sec * 1000.0,
+                    self.config.delay_retry_delay_sec * 1000.0,
                 )
-                self._sleep_interruptibly(self.config.pwid_retry_delay_sec, should_stop)
+                self._sleep_interruptibly(self.config.delay_retry_delay_sec, should_stop)
 
         logger.warning(
-            "%sPWID unavailable after %d Single attempts; using last acquisition",
+            "%s[SDS3104XHD] DELAY unavailable after %d Single attempts; using last acquisition",
             prefix,
             attempt_limit,
         )
-        return PulseWidthAcquisitionResult(
-            pulse_width_s=float("nan"),
-            pulse_width_raw=last_raw,
-            pulse_width_valid=False,
+        return DelayAcquisitionResult(
+            delay_s=float("nan"),
+            delay_raw=last_raw,
+            delay_valid=False,
             attempts=attempt_limit,
             single_seconds=last_single_seconds,
         )
@@ -402,19 +420,35 @@ class SDS3104XHDClient:
 
     def write(self, command: str) -> None:
         if self._inst is None:
-            raise RuntimeError("Scope not connected")
-        self._inst.write(command)
+            raise ScopeCommunicationError(command, "Scope not connected")
+        try:
+            self._inst.write(command)
+        except Exception as exc:
+            if is_communication_exception(exc):
+                raise ScopeCommunicationError(command, exc) from exc
+            raise
 
     def query(self, command: str) -> str:
         if self._inst is None:
-            raise RuntimeError("Scope not connected")
-        return str(self._inst.query(command)).strip()
+            raise ScopeCommunicationError(command, "Scope not connected")
+        try:
+            return str(self._inst.query(command)).strip()
+        except Exception as exc:
+            if is_communication_exception(exc):
+                raise ScopeCommunicationError(command, exc) from exc
+            raise
 
     def _read_binary_block(self, command: str) -> bytes:
         if self._inst is None:
-            raise RuntimeError("Scope not connected")
+            raise ScopeCommunicationError(command, "Scope not connected")
         self.write(command)
-        return parse_ieee4882_binary_block(bytes(self._inst.read_raw()))
+        try:
+            raw = bytes(self._inst.read_raw())
+        except Exception as exc:
+            if is_communication_exception(exc):
+                raise ScopeCommunicationError(command, exc) from exc
+            raise
+        return parse_ieee4882_binary_block(raw)
 
     def acquire_single(self) -> float:
         """Arm one acquisition and wait until the newly-triggered frame stops."""
@@ -427,9 +461,10 @@ class SDS3104XHDClient:
             if status.casefold() == "stop":
                 return time.monotonic() - started
             if time.monotonic() >= deadline:
-                raise TimeoutError(
+                raise ScopeCommunicationError(
+                    ":TRIGger:STATus?",
                     f"Scope Single timed out after {self.config.single_timeout_sec} seconds "
-                    f"(last status: {status or '<empty>'})"
+                    f"(last status: {status or '<empty>'})",
                 )
             time.sleep(self.config.trigger_poll_interval_sec)
 
@@ -479,19 +514,19 @@ class SDS3104XHDClient:
         path: str | Path,
         waveform: ScopeWaveform,
         index: int,
-        positive_pulse_width_s: float = float("nan"),
-        positive_pulse_width_raw: str = "",
-        positive_pulse_width_valid: bool | None = None,
-        positive_pulse_width_attempts: int = 1,
+        delay_s: float = float("nan"),
+        delay_raw: str = "",
+        delay_valid: bool | None = None,
+        delay_attempts: int = 1,
     ) -> None:
         output_path = Path(path)
         preamble = waveform.preamble
         sample_rate = 1.0 / preamble.interval
         device = self._idn or "SIGLENT SDS3104X HD"
-        pulse_width_valid = (
-            math.isfinite(positive_pulse_width_s)
-            if positive_pulse_width_valid is None
-            else bool(positive_pulse_width_valid) and math.isfinite(positive_pulse_width_s)
+        measurement_valid = (
+            math.isfinite(delay_s)
+            if delay_valid is None
+            else bool(delay_valid) and math.isfinite(delay_s)
         )
         with output_path.open("wb") as output_file:
             np.savez_compressed(
@@ -500,13 +535,11 @@ class SDS3104XHDClient:
                 time_s=waveform.time_s.astype(np.float64, copy=False),
                 voltage_v=waveform.voltage_v.astype(np.float32, copy=False),
                 adc=waveform.adc.astype(np.int16, copy=False),
-                positive_pulse_width_s=np.asarray(positive_pulse_width_s, dtype=np.float64),
-                positive_pulse_width_raw=np.asarray(positive_pulse_width_raw, dtype=np.str_),
-                positive_pulse_width_valid=np.asarray(pulse_width_valid, dtype=np.bool_),
-                positive_pulse_width_attempts=np.asarray(
-                    positive_pulse_width_attempts,
-                    dtype=np.int32,
-                ),
+                delay_s=np.asarray(delay_s, dtype=np.float64),
+                delay_raw=np.asarray(delay_raw, dtype=np.str_),
+                delay_valid=np.asarray(measurement_valid, dtype=np.bool_),
+                delay_attempts=np.asarray(delay_attempts, dtype=np.int32),
+                advanced_measurement_type=np.asarray("DELAY", dtype=np.str_),
                 device=np.asarray(device),
                 ip=np.asarray(self.config.ip),
                 channel=np.asarray(self.config.channel),
