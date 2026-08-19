@@ -11,6 +11,7 @@ from data_visualizer import (
     convert_csv_to_png,
     convert_npz_to_png,
     downsample_min_max,
+    format_measurement_annotation,
     load_csv_plot_data,
     load_npz_plot_data,
 )
@@ -181,3 +182,38 @@ def test_recursive_batch_keeps_hierarchy_and_separates_csv_npz(tmp_path: Path) -
     assert skipped.success == 0
     assert skipped.skipped == 2
     assert skipped.failed == 0
+
+
+def test_dual_measurement_npz_png_names_and_cycles_count(tmp_path: Path) -> None:
+    source_root = tmp_path / "data"
+    folder = source_root / "600.000MHz"
+    for measurement_type, value, unit in (
+        ("DELAY", 134.47e-9, "s"),
+        ("CYCLES", 23.5, "count"),
+    ):
+        path = folder / f"000001_{measurement_type.casefold()}.npz"
+        _write_npz(path, None)
+        with np.load(path, allow_pickle=False) as source:
+            values = {key: source[key] for key in source.files}
+        values.update(
+            measurement_type=np.asarray(measurement_type),
+            measurement_value=np.asarray(value, dtype=np.float64),
+            measurement_unit=np.asarray(unit),
+        )
+        np.savez(path, **values)
+
+    cycles = load_npz_plot_data(folder / "000001_cycles.npz")
+    summary = batch_convert(source_root, source_root / "images")
+
+    assert cycles.measurement_type == "CYCLES"
+    assert cycles.measurement_value == pytest.approx(23.5)
+    assert np.isnan(cycles.delay_s)
+    assert format_measurement_annotation(cycles) == ("Measurement: CYCLES", "Cycles: 23.5")
+    delay = load_npz_plot_data(folder / "000001_delay.npz")
+    assert format_measurement_annotation(delay) == (
+        "Measurement: DELAY",
+        "Delay: 134.47 ns",
+    )
+    assert summary.success == 2
+    assert (source_root / "images" / "600.000MHz" / "000001_delay.png").is_file()
+    assert (source_root / "images" / "600.000MHz" / "000001_cycles.png").is_file()

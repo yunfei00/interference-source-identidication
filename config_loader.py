@@ -22,9 +22,11 @@ class ScopeTimingConfig:
     channel: str = "C1"
     single_timeout_sec: float = 30.0
     trigger_poll_interval_ms: int = 50
-    delay_settle_delay_ms: int = 200
-    delay_retry_delay_ms: int = 200
-    delay_max_attempts: int = 3
+    delay_time_scale_sec: float = 5.0e-7
+    cycles_time_scale_sec: float = 1.0e-4
+    measurement_settle_delay_ms: int = 200
+    measurement_retry_delay_ms: int = 200
+    measurement_max_attempts: int = 3
     visa_timeout_ms: int = 60_000
     chunk_size_mb: int = 20
     reconnect_enabled: bool = True
@@ -36,12 +38,33 @@ class ScopeTimingConfig:
         return self.trigger_poll_interval_ms / 1000.0
 
     @property
+    def measurement_settle_delay_sec(self) -> float:
+        return self.measurement_settle_delay_ms / 1000.0
+
+    @property
+    def measurement_retry_delay_sec(self) -> float:
+        return self.measurement_retry_delay_ms / 1000.0
+
+    # Compatibility aliases used by the standalone delay tester and older callers.
+    @property
+    def delay_settle_delay_ms(self) -> int:
+        return self.measurement_settle_delay_ms
+
+    @property
+    def delay_retry_delay_ms(self) -> int:
+        return self.measurement_retry_delay_ms
+
+    @property
+    def delay_max_attempts(self) -> int:
+        return self.measurement_max_attempts
+
+    @property
     def delay_settle_delay_sec(self) -> float:
-        return self.delay_settle_delay_ms / 1000.0
+        return self.measurement_settle_delay_sec
 
     @property
     def delay_retry_delay_sec(self) -> float:
-        return self.delay_retry_delay_ms / 1000.0
+        return self.measurement_retry_delay_sec
 
     @property
     def chunk_size_bytes(self) -> int:
@@ -52,8 +75,14 @@ class ScopeTimingConfig:
 class N9020ATimingConfig:
     visa_timeout_ms: int = 5_000
     reconnect_enabled: bool = True
-    reconnect_delay_sec: float = 15.0
-    reconnect_max_attempts: int = 5
+    calibration_wait_sec: float = 15.0
+    disconnect_reconnect_delay_sec: float = 2.0
+    reconnect_max_attempts: int = 10
+
+    @property
+    def reconnect_delay_sec(self) -> float:
+        """Compatibility alias for releases that used one recovery delay."""
+        return self.calibration_wait_sec
 
 
 @dataclass(frozen=True)
@@ -78,6 +107,8 @@ class AppConfig:
     delay_measurement_test: DelayMeasurementTestConfig = field(
         default_factory=DelayMeasurementTestConfig
     )
+
+
 def load_config(
     path: str | Path | None = None,
     *,
@@ -128,17 +159,32 @@ def load_config(
             defaults.scope.trigger_poll_interval_ms,
             config_path,
         ),
-        delay_settle_delay_ms=_integer_with_legacy(
-            scope_raw, "delay_settle_delay_ms", "pwid_settle_delay_ms",
-            defaults.scope.delay_settle_delay_ms, config_path,
+        delay_time_scale_sec=_number(
+            scope_raw, "delay_time_scale_sec", defaults.scope.delay_time_scale_sec, config_path,
         ),
-        delay_retry_delay_ms=_integer_with_legacy(
-            scope_raw, "delay_retry_delay_ms", "pwid_retry_delay_ms",
-            defaults.scope.delay_retry_delay_ms, config_path,
+        cycles_time_scale_sec=_number(
+            scope_raw, "cycles_time_scale_sec", defaults.scope.cycles_time_scale_sec, config_path,
         ),
-        delay_max_attempts=_integer_with_legacy(
-            scope_raw, "delay_max_attempts", "pwid_max_attempts",
-            defaults.scope.delay_max_attempts, config_path,
+        measurement_settle_delay_ms=_integer_with_legacy_keys(
+            scope_raw,
+            "measurement_settle_delay_ms",
+            ("delay_settle_delay_ms", "pwid_settle_delay_ms"),
+            defaults.scope.measurement_settle_delay_ms,
+            config_path,
+        ),
+        measurement_retry_delay_ms=_integer_with_legacy_keys(
+            scope_raw,
+            "measurement_retry_delay_ms",
+            ("delay_retry_delay_ms", "pwid_retry_delay_ms"),
+            defaults.scope.measurement_retry_delay_ms,
+            config_path,
+        ),
+        measurement_max_attempts=_integer_with_legacy_keys(
+            scope_raw,
+            "measurement_max_attempts",
+            ("delay_max_attempts", "pwid_max_attempts"),
+            defaults.scope.measurement_max_attempts,
+            config_path,
         ),
         visa_timeout_ms=_integer(
             scope_raw,
@@ -173,8 +219,18 @@ def load_config(
         reconnect_enabled=_boolean(
             n9020a_raw, "reconnect_enabled", defaults.n9020a.reconnect_enabled, config_path
         ),
-        reconnect_delay_sec=_number(
-            n9020a_raw, "reconnect_delay_sec", defaults.n9020a.reconnect_delay_sec, config_path
+        calibration_wait_sec=_number_with_legacy(
+            n9020a_raw,
+            "calibration_wait_sec",
+            "reconnect_delay_sec",
+            defaults.n9020a.calibration_wait_sec,
+            config_path,
+        ),
+        disconnect_reconnect_delay_sec=_number(
+            n9020a_raw,
+            "disconnect_reconnect_delay_sec",
+            defaults.n9020a.disconnect_reconnect_delay_sec,
+            config_path,
         ),
         reconnect_max_attempts=_integer(
             n9020a_raw, "reconnect_max_attempts", defaults.n9020a.reconnect_max_attempts,
@@ -297,6 +353,30 @@ def _integer_with_legacy(
     return _integer(section, selected_key, default, path)
 
 
+def _integer_with_legacy_keys(
+    section: dict[str, Any],
+    key: str,
+    legacy_keys: tuple[str, ...],
+    default: int,
+    path: Path,
+) -> int:
+    selected_key = key
+    if key not in section:
+        selected_key = next((legacy for legacy in legacy_keys if legacy in section), key)
+    return _integer(section, selected_key, default, path)
+
+
+def _number_with_legacy(
+    section: dict[str, Any],
+    key: str,
+    legacy_key: str,
+    default: float,
+    path: Path,
+) -> float:
+    selected_key = key if key in section else legacy_key if legacy_key in section else key
+    return _number(section, selected_key, default, path)
+
+
 def _boolean(section: dict[str, Any], key: str, default: bool, path: Path) -> bool:
     value = section.get(key, default)
     if not isinstance(value, bool):
@@ -338,16 +418,24 @@ def _validate(config: AppConfig, path: Path) -> None:
             "scope.trigger_poll_interval_ms must be >= 1",
         ),
         (
-            scope.delay_settle_delay_ms >= 0,
-            "scope.delay_settle_delay_ms must be >= 0",
+            scope.delay_time_scale_sec > 0,
+            "scope.delay_time_scale_sec must be > 0",
         ),
         (
-            scope.delay_retry_delay_ms >= 0,
-            "scope.delay_retry_delay_ms must be >= 0",
+            scope.cycles_time_scale_sec > 0,
+            "scope.cycles_time_scale_sec must be > 0",
         ),
         (
-            1 <= scope.delay_max_attempts <= 10,
-            "scope.delay_max_attempts must be between 1 and 10",
+            scope.measurement_settle_delay_ms >= 0,
+            "scope.measurement_settle_delay_ms must be >= 0",
+        ),
+        (
+            scope.measurement_retry_delay_ms >= 0,
+            "scope.measurement_retry_delay_ms must be >= 0",
+        ),
+        (
+            1 <= scope.measurement_max_attempts <= 10,
+            "scope.measurement_max_attempts must be between 1 and 10",
         ),
         (scope.visa_timeout_ms > 0, "scope.visa_timeout_ms must be > 0"),
         (scope.chunk_size_mb > 0, "scope.chunk_size_mb must be > 0"),
@@ -361,8 +449,12 @@ def _validate(config: AppConfig, path: Path) -> None:
             "n9020a.visa_timeout_ms must be > 0",
         ),
         (
-            config.n9020a.reconnect_delay_sec >= 0,
-            "n9020a.reconnect_delay_sec must be >= 0",
+            config.n9020a.calibration_wait_sec >= 0,
+            "n9020a.calibration_wait_sec must be >= 0",
+        ),
+        (
+            config.n9020a.disconnect_reconnect_delay_sec >= 0,
+            "n9020a.disconnect_reconnect_delay_sec must be >= 0",
         ),
         (
             1 <= config.n9020a.reconnect_max_attempts <= 100,

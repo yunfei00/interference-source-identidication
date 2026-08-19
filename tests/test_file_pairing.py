@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
 from acquisition_worker import AcquisitionWorker, CaptureRequest
 from file_pairing import is_capture_complete, next_capture_index
-from delay_summary import load_delay_summary
-from sds3104xhd_client import DelayAcquisitionResult
+from measurement_summary import load_measurement_summary
+from sds3104xhd_client import AdvancedMeasurementResult
 
 
 def _touch(folder: Path, name: str) -> None:
@@ -22,39 +23,42 @@ def test_legacy_csv_only_mode_uses_max_csv_index(tmp_path: Path) -> None:
     assert next_capture_index(tmp_path, scope_enabled=False) == 4
 
 
-def test_scope_enabled_csv_only_is_not_complete(tmp_path: Path) -> None:
+def test_scope_complete_requires_csv_delay_and_cycles(tmp_path: Path) -> None:
     _touch(tmp_path, "000001.csv")
+    _touch(tmp_path, "000001_delay.npz")
     assert not is_capture_complete(tmp_path, 1, scope_enabled=True)
-    assert next_capture_index(tmp_path, scope_enabled=True) == 1
-
-
-def test_scope_enabled_npz_only_is_not_complete(tmp_path: Path) -> None:
-    _touch(tmp_path, "000001.npz")
-    assert not is_capture_complete(tmp_path, 1, scope_enabled=True)
-    assert next_capture_index(tmp_path, scope_enabled=True) == 1
-
-
-def test_scope_enabled_csv_and_npz_are_complete(tmp_path: Path) -> None:
-    _touch(tmp_path, "000001.csv")
-    _touch(tmp_path, "000001.npz")
+    _touch(tmp_path, "000001_cycles.npz")
     assert is_capture_complete(tmp_path, 1, scope_enabled=True)
     assert next_capture_index(tmp_path, scope_enabled=True) == 2
 
 
-def test_scope_enabled_stops_at_first_incomplete_pair(tmp_path: Path) -> None:
+def test_missing_delay_or_cycles_is_incomplete(tmp_path: Path) -> None:
+    for index, missing in ((1, "delay"), (2, "cycles")):
+        _touch(tmp_path, f"{index:06d}.csv")
+        if missing != "delay":
+            _touch(tmp_path, f"{index:06d}_delay.npz")
+        if missing != "cycles":
+            _touch(tmp_path, f"{index:06d}_cycles.npz")
+        assert not is_capture_complete(tmp_path, index, scope_enabled=True)
+
+
+def test_legacy_unsuffixed_npz_is_not_a_new_complete_group(tmp_path: Path) -> None:
     _touch(tmp_path, "000001.csv")
     _touch(tmp_path, "000001.npz")
-    _touch(tmp_path, "000002.csv")
-    _touch(tmp_path, "000003.csv")
-    _touch(tmp_path, "000003.npz")
-    assert next_capture_index(tmp_path, scope_enabled=True) == 2
+    assert not is_capture_complete(tmp_path, 1, scope_enabled=True)
+    assert next_capture_index(tmp_path, scope_enabled=True) == 1
 
 
 class _FakeN9020A:
+    def __init__(self, events: list[str] | None = None) -> None:
+        self.events = events
+
     def set_center_and_span_mhz(self, _center: float, _span: float) -> None:
         pass
 
     def fetch_csv_text(self) -> str:
+        if self.events is not None:
+            self.events.append("n9020a_csv")
         return "frequency,power\n1,-20"
 
 
@@ -62,210 +66,129 @@ class _FakeWaveform:
     point_count = 2
     voltage_v = np.asarray([-0.25, 1.5], dtype=np.float32)
 
-    def __init__(self, frame: int = 1) -> None:
+    def __init__(self, frame: int) -> None:
         self.frame = frame
+        self.time_s = np.asarray([0.0, 1.0], dtype=np.float64)
+        self.adc = np.asarray([0, 1], dtype=np.int16)
 
 
 class _FakeScope:
-    def __init__(self, fail_save: bool = False) -> None:
+    def __init__(self, events: list[str] | None = None, fail_save: bool = False) -> None:
+        self.events = events
         self.fail_save = fail_save
+        self.frame = 0
+        self.pending_type = ""
+        self.saved_frames: dict[str, int] = {}
+        self.config = SimpleNamespace(delay_time_scale_sec=5e-7, cycles_time_scale_sec=1e-4)
 
-    def acquire_single_with_delay_retry(
-        self,
-        *,
-        capture_index: int,
-        should_stop,
-    ) -> DelayAcquisitionResult:
-        assert capture_index >= 1
-        assert not should_stop()
-        return DelayAcquisitionResult(1.25e-7, "1.25E-07", True, 1, 0.1)
+    def set_time_scale(self, seconds: float) -> None:
+        if self.events is not None:
+            self.events.append(f"scale:{seconds:g}")
+
+    def configure_advanced_measurement(self, measurement_type: str) -> None:
+        self.pending_type = measurement_type
+        if self.events is not None:
+            self.events.append(f"type:{measurement_type}")
+
+    def acquire_single_with_measurement_retry(self, measurement_type: str, **_kwargs):
+        assert measurement_type == self.pending_type
+        self.frame += 1
+        if self.events is not None:
+            self.events.append(f"single:{measurement_type}")
+        value = 125e-9 if measurement_type == "DELAY" else 23.0
+        return AdvancedMeasurementResult(
+            measurement_type,
+            value,
+            f"{value:g}",
+            True,
+            1,
+            0.1,
+            "s" if measurement_type == "DELAY" else "count",
+        )
 
     def read_waveform(self) -> _FakeWaveform:
-        return _FakeWaveform()
+        if self.events is not None:
+            self.events.append(f"waveform:{self.pending_type}")
+        return _FakeWaveform(self.frame)
 
-    def save_npz(
-        self,
-        path: Path,
-        _waveform: _FakeWaveform,
-        index: int,
-        delay_s: float,
-        *,
-        delay_raw: str,
-        delay_valid: bool,
-        delay_attempts: int,
-    ) -> None:
-        with path.open("wb") as output_file:
+    def save_npz(self, path: Path, waveform: _FakeWaveform, index: int, *, measurement_result) -> None:
+        if self.events is not None:
+            self.events.append(f"save:{measurement_result.measurement_type}")
+        self.saved_frames[measurement_result.measurement_type] = waveform.frame
+        with path.open("wb") as output:
             np.savez(
-                output_file,
+                output,
                 index=np.asarray(index, dtype=np.int32),
-                delay_s=np.asarray(delay_s, dtype=np.float64),
-                delay_raw=np.asarray(delay_raw),
-                delay_valid=np.asarray(delay_valid, dtype=np.bool_),
-                delay_attempts=np.asarray(delay_attempts, dtype=np.int32),
-                advanced_measurement_type=np.asarray("DELAY"),
+                time_s=waveform.time_s,
+                voltage_v=waveform.voltage_v,
+                adc=waveform.adc,
+                measurement_type=np.asarray(measurement_result.measurement_type),
+                measurement_value=np.asarray(measurement_result.value, dtype=np.float64),
+                measurement_unit=np.asarray(measurement_result.unit),
+                measurement_raw=np.asarray(measurement_result.raw_value),
+                measurement_valid=np.asarray(measurement_result.valid, dtype=np.bool_),
+                measurement_attempts=np.asarray(measurement_result.attempts, dtype=np.int32),
             )
-        if self.fail_save:
+        if self.fail_save and measurement_result.measurement_type == "CYCLES":
             raise OSError("simulated NPZ save error")
 
 
-def test_worker_commits_csv_and_npz_pair(tmp_path: Path) -> None:
-    _touch(tmp_path, "000001.csv")  # An orphan from an interrupted older run.
-    request = CaptureRequest(tmp_path, index=1, scope_enabled=True)
-    worker = AcquisitionWorker(_FakeN9020A(), _FakeScope(), request)  # type: ignore[arg-type]
-    results: list[dict] = []
+def test_worker_strict_order_independent_singles_and_waveforms(tmp_path: Path) -> None:
+    events: list[str] = []
+    scope = _FakeScope(events)
+    worker = AcquisitionWorker(
+        _FakeN9020A(events), scope, CaptureRequest(tmp_path, index=1, scope_enabled=True)
+    )  # type: ignore[arg-type]
     errors: list[str] = []
-    worker.finished.connect(results.append)
     worker.error.connect(errors.append)
 
     worker.capture_one()
 
     assert not errors
-    assert len(results) == 1
-    assert (tmp_path / "000001.csv").is_file()
-    assert (tmp_path / "000001.npz").is_file()
-    summary = load_delay_summary(tmp_path / "delay_summary.csv")
-    assert len(summary) == 1
-    assert summary[0].index == 1
-    assert summary[0].attempts == 1
-    assert not (tmp_path / "000001.csv.tmp").exists()
-    assert not (tmp_path / "000001.npz.tmp").exists()
+    assert events == [
+        "n9020a_csv",
+        "scale:5e-07",
+        "type:DELAY",
+        "single:DELAY",
+        "waveform:DELAY",
+        "scale:0.0001",
+        "type:CYCLES",
+        "single:CYCLES",
+        "waveform:CYCLES",
+        "save:DELAY",
+        "save:CYCLES",
+    ]
+    assert scope.saved_frames == {"DELAY": 1, "CYCLES": 2}
+    assert is_capture_complete(tmp_path, 1, scope_enabled=True)
+    assert not list(tmp_path.glob("*.tmp"))
 
 
-def test_worker_save_failure_cleans_tmp_and_formal_files(tmp_path: Path) -> None:
-    request = CaptureRequest(tmp_path, index=1, scope_enabled=True)
-    worker = AcquisitionWorker(_FakeN9020A(), _FakeScope(fail_save=True), request)  # type: ignore[arg-type]
+def test_worker_commits_three_files_and_updates_summary(tmp_path: Path) -> None:
+    _touch(tmp_path, "000001.csv")
+    worker = AcquisitionWorker(
+        _FakeN9020A(), _FakeScope(), CaptureRequest(tmp_path, 1, True)
+    )  # type: ignore[arg-type]
+    worker.capture_one()
+
+    assert {path.name for path in tmp_path.glob("000001*")} == {
+        "000001.csv",
+        "000001_delay.npz",
+        "000001_cycles.npz",
+    }
+    records = load_measurement_summary(tmp_path / "measurement_summary.csv")
+    assert len(records) == 1
+    assert records[0].delay_s == 125e-9
+    assert records[0].cycles_count == 23.0
+
+
+def test_worker_failure_cleans_all_tmp_and_formal_files(tmp_path: Path) -> None:
+    worker = AcquisitionWorker(
+        _FakeN9020A(), _FakeScope(fail_save=True), CaptureRequest(tmp_path, 1, True)
+    )  # type: ignore[arg-type]
     errors: list[str] = []
     worker.error.connect(errors.append)
-
     worker.capture_one()
 
     assert errors and "simulated NPZ save error" in errors[0]
-    assert list(tmp_path.iterdir()) == []
+    assert not list(tmp_path.glob("000001*"))
     assert next_capture_index(tmp_path, scope_enabled=True) == 1
-
-
-def test_worker_reads_delay_after_single_and_before_waveform(tmp_path: Path) -> None:
-    events: list[str] = []
-
-    class OrderedN9020A(_FakeN9020A):
-        def fetch_csv_text(self) -> str:
-            events.append("n9020a_csv")
-            return super().fetch_csv_text()
-
-    class OrderedScope(_FakeScope):
-        def acquire_single_with_delay_retry(
-            self,
-            *,
-            capture_index: int,
-            should_stop,
-        ) -> DelayAcquisitionResult:
-            events.append("single")
-            events.append("delay")
-            return super().acquire_single_with_delay_retry(
-                capture_index=capture_index,
-                should_stop=should_stop,
-            )
-
-        def read_waveform(self) -> _FakeWaveform:
-            events.append("waveform")
-            return super().read_waveform()
-
-        def save_npz(
-            self,
-            path: Path,
-            waveform: _FakeWaveform,
-            index: int,
-            delay_s: float,
-            **metadata,
-        ) -> None:
-            events.append("save_npz")
-            super().save_npz(path, waveform, index, delay_s, **metadata)
-
-    worker = AcquisitionWorker(
-        OrderedN9020A(),
-        OrderedScope(),
-        CaptureRequest(tmp_path, index=1, scope_enabled=True),
-    )  # type: ignore[arg-type]
-
-    worker.capture_one()
-
-    assert events == ["single", "delay", "n9020a_csv", "waveform", "save_npz"]
-
-
-def test_unavailable_delay_does_not_fail_capture_pair(tmp_path: Path) -> None:
-    class UnavailableDelayScope(_FakeScope):
-        def acquire_single_with_delay_retry(
-            self,
-            *,
-            capture_index: int,
-            should_stop,
-        ) -> DelayAcquisitionResult:
-            return DelayAcquisitionResult(float("nan"), "****", False, 5, 0.1)
-
-    worker = AcquisitionWorker(
-        _FakeN9020A(),
-        UnavailableDelayScope(),
-        CaptureRequest(tmp_path, index=1, scope_enabled=True),
-    )  # type: ignore[arg-type]
-    errors: list[str] = []
-    worker.error.connect(errors.append)
-
-    worker.capture_one()
-
-    assert not errors
-    assert is_capture_complete(tmp_path, 1, scope_enabled=True)
-    summary = load_delay_summary(tmp_path / "delay_summary.csv")
-    assert summary[0].valid is False
-    assert summary[0].attempts == 5
-    assert summary[0].raw_value == "****"
-
-
-def test_worker_reads_waveform_from_last_delay_attempt(tmp_path: Path) -> None:
-    saved: dict[str, object] = {}
-
-    class FiveAttemptScope(_FakeScope):
-        def __init__(self) -> None:
-            super().__init__()
-            self.frame = 0
-
-        def acquire_single_with_delay_retry(
-            self,
-            *,
-            capture_index: int,
-            should_stop,
-        ) -> DelayAcquisitionResult:
-            for _attempt in range(5):
-                self.frame += 1
-            return DelayAcquisitionResult(float("nan"), "****", False, 5, 0.5)
-
-        def read_waveform(self) -> _FakeWaveform:
-            return _FakeWaveform(self.frame)
-
-        def save_npz(
-            self,
-            path: Path,
-            waveform: _FakeWaveform,
-            index: int,
-            delay_s: float,
-            **metadata,
-        ) -> None:
-            saved["frame"] = waveform.frame
-            saved["attempts"] = metadata["delay_attempts"]
-            super().save_npz(
-                path,
-                waveform,
-                index,
-                delay_s,
-                **metadata,
-            )
-
-    worker = AcquisitionWorker(
-        _FakeN9020A(),
-        FiveAttemptScope(),
-        CaptureRequest(tmp_path, index=1, scope_enabled=True),
-    )  # type: ignore[arg-type]
-
-    worker.capture_one()
-
-    assert saved == {"frame": 5, "attempts": 5}
-    assert is_capture_complete(tmp_path, 1, scope_enabled=True)

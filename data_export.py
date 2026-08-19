@@ -18,6 +18,12 @@ from delay_summary import (
     rebuild_delay_summary,
     write_delay_summary,
 )
+from measurement_summary import (
+    MEASUREMENT_SUMMARY_FILENAME,
+    MeasurementSummaryRecord,
+    load_measurement_summary,
+    rebuild_measurement_summary,
+)
 from pulse_width_summary import (
     PULSE_WIDTH_SUMMARY_FILENAME,
     PULSE_WIDTH_SUMMARY_HEADER,
@@ -92,6 +98,8 @@ class SampleFiles:
     stem: str
     csv_path: Path
     npz_path: Path
+    delay_npz_path: Path
+    cycles_npz_path: Path
 
     @property
     def csv_exists(self) -> bool:
@@ -100,6 +108,18 @@ class SampleFiles:
     @property
     def npz_exists(self) -> bool:
         return self.npz_path.is_file()
+
+    @property
+    def delay_npz_exists(self) -> bool:
+        return self.delay_npz_path.is_file()
+
+    @property
+    def cycles_npz_exists(self) -> bool:
+        return self.cycles_npz_path.is_file()
+
+    @property
+    def is_dual_measurement(self) -> bool:
+        return self.delay_npz_exists or self.cycles_npz_exists
 
 
 @dataclass(frozen=True)
@@ -135,11 +155,21 @@ class MeasurementRecord:
 
     @property
     def measurement_ns(self) -> float:
-        return self.measurement_s * 1e9 if self.valid else float("nan")
+        if not self.valid or self.measurement_type == "CYCLES":
+            return float("nan")
+        return self.measurement_s * 1e9
+
+    @property
+    def analysis_value(self) -> float:
+        if not self.valid:
+            return float("nan")
+        return self.measurement_s if self.measurement_type == "CYCLES" else self.measurement_s * 1e9
 
     @property
     def measurement_label(self) -> str:
-        return "DELAY" if self.measurement_type == "DELAY" else "PWID (Legacy)"
+        if self.measurement_type in {"DELAY", "CYCLES"}:
+            return self.measurement_type
+        return "PWID (Legacy)"
 
 
 # Public compatibility alias for integrations written before DELAY became authoritative.
@@ -217,7 +247,9 @@ def scan_frequency_datasets(
     ]
     datasets.sort(key=lambda item: (float(item.frequency_mhz), item.directory_name.casefold()))
     if any(
-        path.is_file() and path.stem.isdigit() and path.suffix.casefold() in {".csv", ".npz"}
+        path.is_file()
+        and path.suffix.casefold() in {".csv", ".npz"}
+        and _sample_stem(path) is not None
         for path in root.iterdir()
     ):
         datasets.insert(0, FrequencyDataset(root, root.name, None))
@@ -228,8 +260,9 @@ def scan_samples(dataset: FrequencyDataset) -> list[SampleFiles]:
     stems: set[str] = set()
     for suffix in (".csv", ".npz"):
         for path in dataset.path.glob(f"*{suffix}"):
-            if path.stem.isdigit():
-                stems.add(path.stem)
+            stem = _sample_stem(path)
+            if stem is not None:
+                stems.add(stem)
 
     return [
         SampleFiles(
@@ -238,6 +271,8 @@ def scan_samples(dataset: FrequencyDataset) -> list[SampleFiles]:
             stem=stem,
             csv_path=dataset.path / f"{stem}.csv",
             npz_path=dataset.path / f"{stem}.npz",
+            delay_npz_path=dataset.path / f"{stem}_delay.npz",
+            cycles_npz_path=dataset.path / f"{stem}_cycles.npz",
         )
         for stem in sorted(stems, key=lambda item: (int(item), item))
     ]
@@ -379,7 +414,7 @@ def compute_frequency_statistics(records: list[PulseWidthRecord]) -> list[Freque
         groups.items(),
         key=lambda item: (_frequency_sort_value(item[0][0]), item[0][1].casefold()),
     ):
-        values = np.asarray([record.measurement_ns for record in group if record.valid])
+        values = np.asarray([record.analysis_value for record in group if record.valid])
         valid_count = int(values.size)
         total_count = len(group)
         invalid_count = total_count - valid_count
@@ -651,6 +686,142 @@ def generate_pulse_width_html_report(
     return generate_measurement_html_report(data_root, records, statistics, output_path)
 
 
+def generate_dual_measurement_html_report(
+    data_root: str | Path,
+    records: list[PulseWidthRecord],
+    output_path: str | Path,
+) -> Path:
+    """Create one offline report with strictly separate DELAY and CYCLES analyses."""
+    from plotly.offline import get_plotlyjs
+
+    root = Path(data_root)
+    output = Path(output_path)
+    delay_records = [record for record in records if record.measurement_type == "DELAY"]
+    cycles_records = [record for record in records if record.measurement_type == "CYCLES"]
+    if not delay_records or not cycles_records:
+        raise ValueError("A dual measurement report requires both DELAY and CYCLES records")
+    delay_section = _dual_analysis_section(delay_records, "DELAY", "Delay", "ns")
+    cycles_section = _dual_analysis_section(cycles_records, "CYCLES", "Cycles", "count")
+    report_html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DELAY + CYCLES Analysis Report</title>
+<script>{get_plotlyjs()}</script>
+<style>
+body {{ font-family: Arial, sans-serif; margin: 24px; color: #1f2937; }}
+.cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }}
+.card {{ padding: 14px; border: 1px solid #d1d5db; border-radius: 8px; background: #f9fafb; }}
+.card strong {{ display: block; font-size: 1.25rem; margin-top: 6px; }}
+section {{ margin-top: 36px; padding-top: 12px; border-top: 3px solid #334155; }}
+table {{ width: 100%; border-collapse: collapse; margin-top: 14px; }}
+th, td {{ padding: 7px; border: 1px solid #d1d5db; text-align: right; }}
+th:first-child, td:first-child {{ text-align: left; }}
+.plot {{ margin-top: 24px; }}
+</style>
+</head>
+<body>
+<h1>Advanced Measurement Analysis Report</h1>
+<p>Data root: <code>{html.escape(str(root.resolve()))}</code></p>
+{delay_section}
+{cycles_section}
+</body>
+</html>
+"""
+    _write_text_atomic(output, report_html)
+    return output
+
+
+def _dual_analysis_section(
+    records: list[PulseWidthRecord],
+    measurement_type: str,
+    metric_name: str,
+    unit: str,
+) -> str:
+    import plotly.graph_objects as go
+
+    statistics = compute_frequency_statistics(records)
+    groups = _records_by_frequency(records)
+    values = [record.analysis_value for record in records if record.valid]
+    total = len(records)
+    valid = len(values)
+
+    histogram = go.Figure()
+    scatter = go.Figure()
+    box = go.Figure()
+    for name, group in groups.items():
+        valid_group = [record for record in group if record.valid]
+        histogram.add_trace(
+            go.Histogram(x=[record.analysis_value for record in valid_group], name=name)
+        )
+        scatter.add_trace(
+            go.Scatter(
+                x=[record.index for record in valid_group],
+                y=[record.analysis_value for record in valid_group],
+                mode="markers",
+                name=name,
+            )
+        )
+        box.add_trace(
+            go.Box(
+                x=[name] * len(valid_group),
+                y=[record.analysis_value for record in valid_group],
+                name=name,
+                boxpoints="outliers",
+            )
+        )
+    histogram.update_layout(title=f"{measurement_type} Histogram")
+    histogram.update_xaxes(title=f"{metric_name} ({unit})")
+    scatter.update_layout(title=f"Sample Index vs {measurement_type}")
+    scatter.update_xaxes(title="Sample Index")
+    scatter.update_yaxes(title=f"{metric_name} ({unit})")
+    box.update_layout(title=f"{measurement_type} Frequency Box Plot", showlegend=False)
+    box.update_yaxes(title=f"{metric_name} ({unit})")
+
+    trend = go.Figure()
+    trend_x = [
+        item.frequency_mhz if item.frequency_mhz is not None else item.frequency_name
+        for item in statistics
+    ]
+    trend.add_trace(
+        go.Scatter(x=trend_x, y=[item.mean_ns for item in statistics], mode="lines+markers", name="Mean")
+    )
+    trend.add_trace(
+        go.Scatter(x=trend_x, y=[item.median_ns for item in statistics], mode="lines+markers", name="Median")
+    )
+    trend.update_layout(title=f"Frequency vs Mean/Median {measurement_type}")
+    trend.update_xaxes(title="Frequency (MHz)")
+    trend.update_yaxes(title=f"{metric_name} ({unit})")
+
+    aggregate = np.asarray(values, dtype=np.float64)
+    def aggregate_text(function) -> str:
+        return _format_number(float(function(aggregate))) if valid else "nan"
+
+    cards = (
+        _report_card("Total", str(total))
+        + _report_card("Valid", str(valid))
+        + _report_card("Invalid", str(total - valid))
+        + _report_card("Valid Rate", f"{valid / total:.2%}" if total else "0.00%")
+        + _report_card(f"Mean ({unit})", aggregate_text(np.mean))
+        + _report_card(f"Median ({unit})", aggregate_text(np.median))
+        + _report_card(f"Std ({unit})", aggregate_text(np.std))
+        + _report_card(f"Min ({unit})", aggregate_text(np.min))
+        + _report_card(f"Max ({unit})", aggregate_text(np.max))
+        + _report_card(f"P05 ({unit})", aggregate_text(lambda values: np.percentile(values, 5)))
+        + _report_card(f"P95 ({unit})", aggregate_text(lambda values: np.percentile(values, 95)))
+    )
+    return (
+        f"<section><h2>{measurement_type} Analysis</h2>"
+        f"<div class=\"cards\">{cards}</div>"
+        + _statistics_html_table(statistics, unit)
+        + f'<div class="plot">{histogram.to_html(full_html=False, include_plotlyjs=False)}</div>'
+        + f'<div class="plot">{scatter.to_html(full_html=False, include_plotlyjs=False)}</div>'
+        + f'<div class="plot">{box.to_html(full_html=False, include_plotlyjs=False)}</div>'
+        + f'<div class="plot">{trend.to_html(full_html=False, include_plotlyjs=False)}</div></section>'
+    )
+
+
 def run_data_export(
     data_root: str | Path,
     output_root: str | Path,
@@ -680,15 +851,37 @@ def run_data_export(
     file_jobs: list[tuple[str, Path, Path, Callable[[Path, Path], Path]]] = []
     for sample in samples:
         relative_folder = Path(sample.dataset.directory_name)
-        if options.scope_csv and sample.npz_exists:
-            file_jobs.append(
+        scope_sources: list[tuple[Path, str, str]] = []
+        if sample.npz_exists:
+            scope_sources.append(
+                (sample.npz_path, f"{sample.stem}_scope.csv", f"{sample.stem}_npz.png")
+            )
+        if sample.delay_npz_exists:
+            scope_sources.append(
                 (
-                    f"Scope CSV: {sample.dataset.directory_name}/{sample.npz_path.name}",
-                    sample.npz_path,
-                    output_root_path / "scope_csv" / relative_folder / f"{sample.stem}_scope.csv",
-                    export_scope_npz_to_csv,
+                    sample.delay_npz_path,
+                    f"{sample.stem}_delay_scope.csv",
+                    f"{sample.stem}_delay.png",
                 )
             )
+        if sample.cycles_npz_exists:
+            scope_sources.append(
+                (
+                    sample.cycles_npz_path,
+                    f"{sample.stem}_cycles_scope.csv",
+                    f"{sample.stem}_cycles.png",
+                )
+            )
+        if options.scope_csv:
+            for source, csv_name, _png_name in scope_sources:
+                file_jobs.append(
+                    (
+                        f"Scope CSV: {sample.dataset.directory_name}/{source.name}",
+                        source,
+                        output_root_path / "scope_csv" / relative_folder / csv_name,
+                        export_scope_npz_to_csv,
+                    )
+                )
         if options.n9020a_png and sample.csv_exists:
             file_jobs.append(
                 (
@@ -698,15 +891,16 @@ def run_data_export(
                     convert_csv_to_png,
                 )
             )
-        if options.scope_png and sample.npz_exists:
-            file_jobs.append(
-                (
-                    f"Scope PNG: {sample.dataset.directory_name}/{sample.npz_path.name}",
-                    sample.npz_path,
-                    output_root_path / "images" / relative_folder / f"{sample.stem}_npz.png",
-                    convert_npz_to_png,
+        if options.scope_png:
+            for source, _csv_name, png_name in scope_sources:
+                file_jobs.append(
+                    (
+                        f"Scope PNG: {sample.dataset.directory_name}/{source.name}",
+                        source,
+                        output_root_path / "images" / relative_folder / png_name,
+                        convert_npz_to_png,
+                    )
                 )
-            )
 
     summary_requested = options.measurement_summary or options.pulse_width_summary
     needs_records = summary_requested or options.html_report
@@ -757,7 +951,10 @@ def run_data_export(
                 return summary
             rebuild = summary_requested
             measurement_type = _dataset_measurement_type(dataset)
-            if measurement_type == "DELAY":
+            if measurement_type == "DUAL":
+                summary_filename = MEASUREMENT_SUMMARY_FILENAME
+                metric_label = "DELAY + CYCLES"
+            elif measurement_type == "DELAY":
                 summary_filename = DELAY_SUMMARY_FILENAME
                 metric_label = "DELAY"
             elif measurement_type == "PWID":
@@ -780,45 +977,82 @@ def run_data_export(
                         "No DELAY or legacy PWID measurement metadata was found"
                     )
                 if rebuild or not summary_path.is_file():
-                    if measurement_type == "DELAY":
+                    if measurement_type == "DUAL":
+                        rebuild_measurement_summary(dataset.path)
+                    elif measurement_type == "DELAY":
                         rebuild_delay_summary(dataset.path)
                     else:
                         rebuild_pulse_width_summary(dataset.path)
-                records.extend(
-                    _records_from_summary(
-                        dataset,
-                        data_root_path,
-                        summary_path,
-                        measurement_type,
+                if measurement_type == "DUAL":
+                    records.extend(
+                        _records_from_measurement_summary(
+                            dataset,
+                            data_root_path,
+                            summary_path,
+                        )
                     )
-                )
+                else:
+                    records.extend(
+                        _records_from_summary(
+                            dataset,
+                            data_root_path,
+                            summary_path,
+                            measurement_type,
+                        )
+                    )
             except Exception as exc:
                 report_result(label, "failed", f"{type(exc).__name__}: {exc}")
             else:
                 report_result(label, "success")
 
-    measurement_type = _measurement_type(records)
-    statistics = compute_frequency_statistics(records)
+    record_types = {
+        record.measurement_type for record in records if record.measurement_type != "UNKNOWN"
+    }
+    dual_measurement = record_types == {"DELAY", "CYCLES"}
+    measurement_type = "DUAL" if dual_measurement else _measurement_type(records)
+    statistics = (
+        [] if dual_measurement else compute_frequency_statistics(records)
+    )
     if summary_requested:
         summary_outputs: list[tuple[str, Path, Callable[[], Path]]] = []
-        file_prefix = "delay" if measurement_type == "DELAY" else "pulse_width"
-        display_label = "DELAY" if measurement_type == "DELAY" else "PWID (Legacy)"
+        if measurement_type == "DUAL":
+            file_prefix = "measurement"
+            display_label = "DELAY + CYCLES"
+        else:
+            file_prefix = "delay" if measurement_type == "DELAY" else "pulse_width"
+            display_label = "DELAY" if measurement_type == "DELAY" else "PWID (Legacy)"
         all_path = output_root_path / "summary" / f"{file_prefix}_all.csv"
         by_frequency_path = output_root_path / "summary" / f"{file_prefix}_by_frequency.csv"
-        summary_outputs.extend(
-            (
+        if measurement_type == "DUAL":
+            summary_outputs.extend(
                 (
-                    f"{display_label} summary: all",
-                    all_path,
-                    lambda: write_all_summary(records, all_path),
-                ),
-                (
-                    f"{display_label} summary: by frequency",
-                    by_frequency_path,
-                    lambda: write_by_frequency_summary(statistics, by_frequency_path),
-                ),
+                    (
+                        f"{display_label} summary: all",
+                        all_path,
+                        lambda: _write_dual_all_summary(records, all_path),
+                    ),
+                    (
+                        f"{display_label} summary: by frequency",
+                        by_frequency_path,
+                        lambda: _write_dual_by_frequency_summary(records, by_frequency_path),
+                    ),
+                )
             )
-        )
+        else:
+            summary_outputs.extend(
+                (
+                    (
+                        f"{display_label} summary: all",
+                        all_path,
+                        lambda: write_all_summary(records, all_path),
+                    ),
+                    (
+                        f"{display_label} summary: by frequency",
+                        by_frequency_path,
+                        lambda: write_by_frequency_summary(statistics, by_frequency_path),
+                    ),
+                )
+            )
         for label, destination, action in summary_outputs:
             if stopped():
                 summary.stopped = True
@@ -837,8 +1071,12 @@ def run_data_export(
 
     if options.html_report:
         legacy = measurement_type == "PWID"
-        label = "Offline HTML PWID (Legacy) report" if legacy else "Offline HTML DELAY report"
-        filename = "pulse_width_report.html" if legacy else "delay_report.html"
+        if measurement_type == "DUAL":
+            label = "Offline HTML DELAY + CYCLES report"
+            filename = "measurement_report.html"
+        else:
+            label = "Offline HTML PWID (Legacy) report" if legacy else "Offline HTML DELAY report"
+            filename = "pulse_width_report.html" if legacy else "delay_report.html"
         destination = output_root_path / "reports" / filename
         if stopped():
             summary.stopped = True
@@ -849,12 +1087,19 @@ def run_data_export(
             report_result(label, "skipped")
         else:
             try:
-                generate_measurement_html_report(
-                    data_root_path,
-                    records,
-                    statistics,
-                    destination,
-                )
+                if measurement_type == "DUAL":
+                    generate_dual_measurement_html_report(
+                        data_root_path,
+                        records,
+                        destination,
+                    )
+                else:
+                    generate_measurement_html_report(
+                        data_root_path,
+                        records,
+                        statistics,
+                        destination,
+                    )
             except Exception as exc:
                 report_result(label, "failed", f"{type(exc).__name__}: {exc}")
             else:
@@ -908,6 +1153,169 @@ def _records_from_summary(
     return records
 
 
+def _records_from_measurement_summary(
+    dataset: FrequencyDataset,
+    data_root: Path,
+    summary_path: Path,
+) -> list[PulseWidthRecord]:
+    records: list[PulseWidthRecord] = []
+    items = load_measurement_summary(summary_path)
+    completed = [
+        item
+        for item in items
+        if all(
+            (dataset.path / name).is_file()
+            for name in (item.csv_file, item.delay_npz_file, item.cycles_npz_file)
+        )
+    ]
+    for item in completed:
+        csv_file = _relative_path(dataset.path / item.csv_file, data_root)
+        records.extend(
+            (
+                MeasurementRecord(
+                    frequency_mhz=dataset.frequency_mhz,
+                    frequency_name=dataset.directory_name,
+                    index=item.index,
+                    measurement_s=item.delay_s,
+                    measurement_valid=item.delay_valid,
+                    attempts=item.delay_attempts,
+                    raw_value=item.delay_raw,
+                    npz_file=_relative_path(dataset.path / item.delay_npz_file, data_root),
+                    csv_file=csv_file,
+                    pair_status="paired",
+                    measurement_type="DELAY",
+                ),
+                MeasurementRecord(
+                    frequency_mhz=dataset.frequency_mhz,
+                    frequency_name=dataset.directory_name,
+                    index=item.index,
+                    measurement_s=item.cycles_count,
+                    measurement_valid=item.cycles_valid,
+                    attempts=item.cycles_attempts,
+                    raw_value=item.cycles_raw,
+                    npz_file=_relative_path(dataset.path / item.cycles_npz_file, data_root),
+                    csv_file=csv_file,
+                    pair_status="paired",
+                    measurement_type="CYCLES",
+                ),
+            )
+        )
+    return records
+
+
+def _write_dual_all_summary(records: list[PulseWidthRecord], output_path: Path) -> Path:
+    header = (
+        "frequency_mhz",
+        "frequency_name",
+        "index",
+        "delay_s",
+        "delay_ns",
+        "delay_valid",
+        "delay_attempts",
+        "delay_raw",
+        "cycles_count",
+        "cycles_valid",
+        "cycles_attempts",
+        "cycles_raw",
+        "delay_npz_file",
+        "cycles_npz_file",
+        "csv_file",
+    )
+    grouped: dict[tuple[str, int], dict[str, PulseWidthRecord]] = {}
+    for record in records:
+        grouped.setdefault((record.frequency_name, record.index), {})[
+            record.measurement_type
+        ] = record
+    rows = []
+    for (frequency_name, index), pair in sorted(
+        grouped.items(),
+        key=lambda item: (
+            _frequency_sort_value(next(iter(item[1].values())).frequency_mhz),
+            item[0][0],
+            item[0][1],
+        ),
+    ):
+        delay = pair.get("DELAY")
+        cycles = pair.get("CYCLES")
+        if delay is None or cycles is None:
+            continue
+        rows.append(
+            (
+                _format_number(delay.frequency_mhz),
+                frequency_name,
+                index,
+                _format_number(delay.measurement_s),
+                _format_number(delay.measurement_ns),
+                int(delay.valid),
+                delay.attempts,
+                delay.raw_value,
+                _format_number(cycles.measurement_s),
+                int(cycles.valid),
+                cycles.attempts,
+                cycles.raw_value,
+                delay.npz_file,
+                cycles.npz_file,
+                delay.csv_file,
+            )
+        )
+    return _write_csv_atomic(output_path, header, rows)
+
+
+def _write_dual_by_frequency_summary(
+    records: list[PulseWidthRecord],
+    output_path: Path,
+) -> Path:
+    header = (
+        "frequency_mhz",
+        "frequency_name",
+        "delay_total",
+        "delay_valid",
+        "delay_mean_ns",
+        "delay_median_ns",
+        "cycles_total",
+        "cycles_valid",
+        "cycles_mean_count",
+        "cycles_median_count",
+    )
+    delay_stats = {
+        item.frequency_name: item
+        for item in compute_frequency_statistics(
+            [record for record in records if record.measurement_type == "DELAY"]
+        )
+    }
+    cycles_stats = {
+        item.frequency_name: item
+        for item in compute_frequency_statistics(
+            [record for record in records if record.measurement_type == "CYCLES"]
+        )
+    }
+    rows = []
+    for name in sorted(
+        set(delay_stats) | set(cycles_stats),
+        key=lambda item: _frequency_sort_value(
+            (delay_stats.get(item) or cycles_stats[item]).frequency_mhz
+        ),
+    ):
+        delay = delay_stats.get(name)
+        cycles = cycles_stats.get(name)
+        exemplar = delay or cycles
+        rows.append(
+            (
+                _format_number(exemplar.frequency_mhz if exemplar else None),
+                name,
+                delay.total_samples if delay else 0,
+                delay.valid_samples if delay else 0,
+                _format_number(delay.mean_ns if delay else float("nan")),
+                _format_number(delay.median_ns if delay else float("nan")),
+                cycles.total_samples if cycles else 0,
+                cycles.valid_samples if cycles else 0,
+                _format_number(cycles.mean_ns if cycles else float("nan")),
+                _format_number(cycles.median_ns if cycles else float("nan")),
+            )
+        )
+    return _write_csv_atomic(output_path, header, rows)
+
+
 def _summary_row(record: PulseWidthRecord) -> tuple:
     return (
         record.index,
@@ -923,6 +1331,10 @@ def _summary_row(record: PulseWidthRecord) -> tuple:
 
 def _dataset_measurement_type(dataset: FrequencyDataset) -> str:
     """Prefer a DELAY summary and otherwise identify legacy NPZ metadata explicitly."""
+    if (dataset.path / MEASUREMENT_SUMMARY_FILENAME).is_file() or any(
+        dataset.path.glob("*_delay.npz")
+    ):
+        return "DUAL"
     if (dataset.path / DELAY_SUMMARY_FILENAME).is_file():
         return "DELAY"
     if (dataset.path / PULSE_WIDTH_SUMMARY_FILENAME).is_file():
@@ -952,6 +1364,17 @@ def _measurement_type(records: list[PulseWidthRecord]) -> str:
             "DELAY and legacy PWID datasets cannot be mixed in one analysis report"
         )
     return next(iter(types), "DELAY")
+
+
+def _sample_stem(path: Path) -> str | None:
+    stem = path.stem
+    if stem.isdigit():
+        return stem
+    for suffix in ("_delay", "_cycles"):
+        if stem.endswith(suffix):
+            candidate = stem.removesuffix(suffix)
+            return candidate if candidate.isdigit() else None
+    return None
 
 
 def _write_csv_atomic(path: Path, header: tuple[str, ...], rows) -> Path:
@@ -1019,20 +1442,23 @@ def _frequency_range_text(frequencies: list[float]) -> str:
     return f"{min(frequencies):g}–{max(frequencies):g} MHz"
 
 
-def _statistics_html_table(statistics: list[FrequencyStatistics]) -> str:
+def _statistics_html_table(
+    statistics: list[FrequencyStatistics],
+    unit_label: str = "ns",
+) -> str:
     columns = (
         "Frequency",
         "Total",
         "Valid",
         "Invalid",
         "Valid rate",
-        "Mean ns",
-        "Median ns",
-        "Std ns",
-        "Min ns",
-        "Max ns",
-        "P05 ns",
-        "P95 ns",
+        f"Mean {unit_label}",
+        f"Median {unit_label}",
+        f"Std {unit_label}",
+        f"Min {unit_label}",
+        f"Max {unit_label}",
+        f"P05 {unit_label}",
+        f"P95 {unit_label}",
     )
     rows = []
     for item in statistics:

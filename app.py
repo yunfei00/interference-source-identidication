@@ -238,8 +238,8 @@ class MainWindow(QMainWindow):
         self.export_scope_csv_check = QCheckBox("示波器 NPZ → CSV")
         self.export_n9020a_png_check = QCheckBox("N9020A CSV → PNG")
         self.export_scope_png_check = QCheckBox("示波器 NPZ → PNG")
-        self.export_summary_check = QCheckBox("重建 DELAY 汇总 CSV")
-        self.export_html_check = QCheckBox("DELAY HTML 分析报告")
+        self.export_summary_check = QCheckBox("重建测量汇总 CSV")
+        self.export_html_check = QCheckBox("DELAY + CYCLES HTML 分析报告")
         for checkbox in (
             self.export_scope_csv_check,
             self.export_n9020a_png_check,
@@ -375,7 +375,10 @@ class MainWindow(QMainWindow):
                     timeout_ms=self.app_config.n9020a.visa_timeout_ms,
                     remote_csv_path=remote_csv_path,
                     reconnect_enabled=self.app_config.n9020a.reconnect_enabled,
-                    reconnect_delay_sec=self.app_config.n9020a.reconnect_delay_sec,
+                    calibration_wait_sec=self.app_config.n9020a.calibration_wait_sec,
+                    disconnect_reconnect_delay_sec=(
+                        self.app_config.n9020a.disconnect_reconnect_delay_sec
+                    ),
                     reconnect_max_attempts=self.app_config.n9020a.reconnect_max_attempts,
                 )
             )
@@ -411,6 +414,8 @@ class MainWindow(QMainWindow):
             reconnect_enabled=timing.reconnect_enabled,
             reconnect_delay_sec=timing.reconnect_delay_sec,
             reconnect_max_attempts=timing.reconnect_max_attempts,
+            delay_time_scale_sec=timing.delay_time_scale_sec,
+            cycles_time_scale_sec=timing.cycles_time_scale_sec,
         )
         candidate = SDS3104XHDClient(config)
         try:
@@ -631,7 +636,7 @@ class MainWindow(QMainWindow):
     def _disconnect(self) -> None:
         self._stop_collect()
         if self.client:
-            self.client.disconnect()
+            self.client.disconnect(return_to_local=True)
         self.client = None
         self.connected = False
         self.connect_btn.setText("连接仪表")
@@ -677,7 +682,7 @@ class MainWindow(QMainWindow):
         if self.time_domain_check.isChecked():
             current = max(self.state.current_index - 1, 0)
             self.progress_label.setText(f"当前频点进度：{current} / {total}")
-            suffix = ".csv + .npz" if self.scope_enabled_check.isChecked() else ".csv"
+            suffix = ".csv + _delay.npz + _cycles.npz" if self.scope_enabled_check.isChecked() else ".csv"
             self.next_file_label.setText(
                 f"下一个文件：按频率目录/{self.state.current_index:06d}{suffix}"
             )
@@ -685,7 +690,7 @@ class MainWindow(QMainWindow):
         else:
             current = max(self.state.current_index - 1, 0)
             self.progress_label.setText(f"进度：{current} / {total}")
-            suffix = ".csv + .npz" if self.scope_enabled_check.isChecked() else ".csv"
+            suffix = ".csv + _delay.npz + _cycles.npz" if self.scope_enabled_check.isChecked() else ".csv"
             self.next_file_label.setText(f"下一个文件：{self.state.current_index:06d}{suffix}")
             self.current_freq_label.setText("当前频率：--")
 
@@ -698,13 +703,6 @@ class MainWindow(QMainWindow):
         if scope_enabled and (not self.scope_connected or self.scope_client is None):
             QMessageBox.warning(self, "提示", "已启用示波器采集，请先连接示波器")
             return
-        if scope_enabled:
-            try:
-                self.scope_client.configure_delay_measurement()
-            except Exception as exc:
-                QMessageBox.critical(self, "示波器配置失败", str(exc))
-                return
-
         folder_text = self.folder_edit.text().strip()
         if not folder_text:
             QMessageBox.warning(self, "提示", "请先选择存储文件夹")
@@ -816,13 +814,15 @@ class MainWindow(QMainWindow):
 
         scope_stats = result.get("scope")
         if scope_stats:
+            delay = scope_stats["delay"]
+            cycles = scope_stats["cycles"]
+            cycles_text = f"{cycles['value']:g}" if cycles["valid"] else "N/A"
             self.scope_status_label.setText(
                 f"Scope：{self.scope_idn}\n"
-                f"Points: {scope_stats['point_count']:,}\n"
-                f"Voltage: {scope_stats['min_voltage']:.3f} ~ "
-                f"{scope_stats['max_voltage']:.3f} V\n"
-                f"DELAY: {format_time_value(scope_stats['delay_s'])}\n"
-                f"DELAY attempts: {scope_stats['delay_attempts']}\n"
+                f"DELAY: {format_time_value(delay['value'])} "
+                f"(attempts {delay['attempts']}, points {delay['point_count']:,})\n"
+                f"CYCLES: {cycles_text} count "
+                f"(attempts {cycles['attempts']}, points {cycles['point_count']:,})\n"
                 f"Read: {scope_stats['read_seconds']:.2f} s\n"
                 f"Save: {scope_stats['save_seconds']:.2f} s"
             )
@@ -842,6 +842,8 @@ class MainWindow(QMainWindow):
 
     def _on_capture_status(self, message: str) -> None:
         self.status_label.setText(f"状态：{message}")
+        if message.startswith("Scope:"):
+            self.scope_status_label.setText(message)
         logger.info(message)
 
     def _on_worker_thread_finished(self) -> None:
@@ -941,7 +943,7 @@ class MainWindow(QMainWindow):
             return
         self._save_state()
         if self.client:
-            self.client.disconnect()
+            self.client.disconnect(return_to_local=True)
         self.client = None
         self.connected = False
         if self.scope_client:

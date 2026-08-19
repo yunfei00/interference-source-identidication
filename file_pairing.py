@@ -8,7 +8,14 @@ def is_capture_complete(folder: Path, index: int, scope_enabled: bool) -> bool:
     csv_exists = (folder / f"{stem}.csv").is_file()
     if not scope_enabled:
         return csv_exists
-    return csv_exists and (folder / f"{stem}.npz").is_file()
+    return all(
+        path.is_file()
+        for path in (
+            folder / f"{stem}.csv",
+            folder / f"{stem}_delay.npz",
+            folder / f"{stem}_cycles.npz",
+        )
+    )
 
 
 def next_capture_index(folder: Path, scope_enabled: bool) -> int:
@@ -32,10 +39,19 @@ def next_capture_index(folder: Path, scope_enabled: bool) -> int:
 
 
 def remove_incomplete_pair(folder: Path, index: int) -> None:
-    """Remove an orphan CSV or NPZ so retrying an index starts from a clean pair."""
+    """Compatibility name: remove an incomplete new three-file capture group."""
+    remove_incomplete_group(folder, index)
+
+
+def remove_incomplete_group(folder: Path, index: int) -> None:
+    """Remove partial formal files so retrying an index starts from a clean group."""
     stem = f"{index:06d}"
-    csv_path = folder / f"{stem}.csv"
-    npz_path = folder / f"{stem}.npz"
-    if csv_path.exists() != npz_path.exists():
-        csv_path.unlink(missing_ok=True)
-        npz_path.unlink(missing_ok=True)
+    paths = (
+        folder / f"{stem}.csv",
+        folder / f"{stem}_delay.npz",
+        folder / f"{stem}_cycles.npz",
+    )
+    present = sum(path.is_file() for path in paths)
+    if 0 < present < len(paths):
+        for path in paths:
+            path.unlink(missing_ok=True)

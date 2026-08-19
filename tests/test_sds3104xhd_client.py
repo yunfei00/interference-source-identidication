@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import struct
+import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import sds3104xhd_client as scope_module
 
 from sds3104xhd_client import (
+    AdvancedMeasurementResult,
     AcquisitionStopped,
     PREAMBLE_MIN_BYTES,
     SDS3104XHDClient,
@@ -125,6 +128,71 @@ def test_delay_configuration_command(monkeypatch) -> None:
     client.configure_delay_measurement()
 
     assert commands == ["MEAS:ADV:P1:TYPE DELAY"]
+
+
+def test_delay_and_cycles_time_scale_commands_are_exact(monkeypatch) -> None:
+    client = SDS3104XHDClient(_scope_config())
+    commands: list[str] = []
+    monkeypatch.setattr(client, "write", commands.append)
+    client.set_time_scale(5e-7)
+    client.set_time_scale(1e-4)
+    assert commands == [":TIM:SCAL 5.00E-7", ":TIM:SCAL 1.00E-4"]
+
+
+def test_cycles_configuration_and_allowlist(monkeypatch) -> None:
+    client = SDS3104XHDClient(_scope_config())
+    commands: list[str] = []
+    monkeypatch.setattr(client, "write", commands.append)
+    client.configure_advanced_measurement("cycles")
+    assert commands == ["MEAS:ADV:P1:TYPE CYCLES"]
+    with pytest.raises(ValueError, match="Unsupported"):
+        client.configure_advanced_measurement("FREQ")
+
+
+def test_connect_initializes_channel_without_fixing_measurement_type(monkeypatch) -> None:
+    class Instrument:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+            self.timeout = 0
+            self.chunk_size = 0
+
+        def query(self, command: str) -> str:
+            assert command == "*IDN?"
+            return "SIGLENT,SDS3104X HD,TEST,1.0"
+
+        def write(self, command: str) -> None:
+            self.commands.append(command)
+
+        def close(self) -> None:
+            pass
+
+    instrument = Instrument()
+    manager = SimpleNamespace(
+        open_resource=lambda _resource: instrument,
+        close=lambda: None,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "pyvisa",
+        SimpleNamespace(ResourceManager=lambda: manager),
+    )
+    client = SDS3104XHDClient(_scope_config())
+
+    client.connect()
+
+    assert instrument.commands == [":WAVeform:SOURce C1"]
+    assert not any("MEAS:ADV:P1:TYPE" in command for command in instrument.commands)
+
+
+def test_cycles_retry_result_uses_count_not_seconds(monkeypatch) -> None:
+    client = SDS3104XHDClient(_scope_config())
+    monkeypatch.setattr(client, "acquire_single", lambda: 0.1)
+    monkeypatch.setattr(client, "query", lambda _command: "23.5")
+    result = client.acquire_single_with_measurement_retry("CYCLES")
+    assert result.measurement_type == "CYCLES"
+    assert result.value == pytest.approx(23.5)
+    assert result.unit == "count"
+    assert np.isnan(result.delay_s)
 
 
 def test_delay_read_uses_advanced_p1_query(monkeypatch) -> None:
@@ -336,3 +404,28 @@ def test_npz_save_keeps_tmp_name_and_required_dtypes(tmp_path) -> None:
         assert "positive_pulse_width_s" not in saved
         assert int(saved["point_count"]) == 3
         assert str(saved["channel"]) == "C1"
+
+
+def test_cycles_npz_uses_generic_count_metadata(tmp_path) -> None:
+    preamble = parse_preamble(_make_preamble())
+    waveform = ScopeWaveform(
+        adc=np.asarray([0, 1], dtype=np.int16),
+        time_s=np.asarray([0.0, 1.0], dtype=np.float64),
+        voltage_v=np.asarray([0.0, 1.0], dtype=np.float32),
+        preamble=preamble,
+    )
+    output = tmp_path / "000001_cycles.npz.tmp"
+    client = SDS3104XHDClient(_scope_config())
+    client.save_npz(
+        output,
+        waveform,
+        1,
+        measurement_result=AdvancedMeasurementResult(
+            "CYCLES", 23.5, "2.35E1", True, 2, 0.1, "count"
+        ),
+    )
+    with np.load(output, allow_pickle=False) as saved:
+        assert str(saved["measurement_type"]) == "CYCLES"
+        assert str(saved["measurement_unit"]) == "count"
+        assert float(saved["measurement_value"]) == pytest.approx(23.5)
+        assert "delay_s" not in saved

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from instrument_errors import N9020ACommunicationError, is_communication_exception
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -11,8 +15,13 @@ class N9020AConfig:
     timeout_ms: int
     remote_csv_path: str = r"D:\\data.csv"
     reconnect_enabled: bool = True
-    reconnect_delay_sec: float = 15.0
-    reconnect_max_attempts: int = 5
+    calibration_wait_sec: float = 15.0
+    disconnect_reconnect_delay_sec: float = 2.0
+    reconnect_max_attempts: int = 10
+
+    @property
+    def reconnect_delay_sec(self) -> float:
+        return self.calibration_wait_sec
 
 
 class N9020AClient:
@@ -33,19 +42,26 @@ class N9020AClient:
             self._inst.timeout = self.config.timeout_ms
             self._idn = self.query("*IDN?")
         except Exception as exc:
-            self.disconnect()
+            self.disconnect(return_to_local=False)
             if is_communication_exception(exc):
                 raise N9020ACommunicationError("connect/*IDN?", exc) from exc
             raise
 
-    def disconnect(self) -> None:
+    def disconnect(self, return_to_local: bool = False) -> None:
         if self._inst is not None:
             try:
-                self._inst.close()
-            except Exception:
-                pass
+                if return_to_local:
+                    try:
+                        self._inst.write("SYST:LOC")
+                    except Exception as exc:
+                        logger.warning("[N9020A] unable to restore Local control: %s", exc)
             finally:
-                self._inst = None
+                try:
+                    self._inst.close()
+                except Exception:
+                    pass
+                finally:
+                    self._inst = None
         if self._rm is not None:
             try:
                 self._rm.close()
@@ -60,7 +76,7 @@ class N9020AClient:
 
     def reconnect(self) -> str:
         """Create a fresh VISA session and return the verified identity string."""
-        self.disconnect()
+        self.disconnect(return_to_local=False)
         self.connect()
         return self._idn
 

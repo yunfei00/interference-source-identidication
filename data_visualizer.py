@@ -27,6 +27,10 @@ class NPZPlotData:
     point_count: int
 
     @property
+    def measurement_value(self) -> float:
+        return self.measurement_s
+
+    @property
     def delay_s(self) -> float:
         return self.measurement_s if self.measurement_type == "DELAY" else float("nan")
 
@@ -126,7 +130,10 @@ def load_npz_plot_data(
             max_plot_points,
         )
 
-        if "delay_s" in data:
+        if "measurement_type" in data and "measurement_value" in data:
+            measurement = _npz_float(data, "measurement_value", float("nan"))
+            measurement_type = _npz_text(data, "measurement_type", "UNKNOWN").upper()
+        elif "delay_s" in data:
             measurement = _npz_float(data, "delay_s", float("nan"))
             measurement_type = "DELAY"
         elif "positive_pulse_width_s" in data:
@@ -235,22 +242,7 @@ def convert_npz_to_png(
             f"Channel: {plot_data.channel}",
             f"Points: {plot_data.point_count:,}",
         ]
-        if plot_data.measurement_type == "DELAY":
-            details.extend(
-                (
-                    "Measurement Type: DELAY",
-                    f"Delay: {format_time_value(plot_data.measurement_s)}",
-                )
-            )
-        elif plot_data.measurement_type == "PWID":
-            details.extend(
-                (
-                    "Measurement Type: PWID (Legacy)",
-                    f"Positive Pulse Width: {format_time_value(plot_data.measurement_s)}",
-                )
-            )
-        else:
-            details.extend(("Measurement Type: Unknown", "Advanced Measurement: N/A"))
+        details.extend(format_measurement_annotation(plot_data))
         sample_rate = _format_sample_rate(plot_data.sample_rate)
         if sample_rate:
             details.insert(1, f"Sample Rate: {sample_rate}")
@@ -270,6 +262,20 @@ def convert_npz_to_png(
         if figure is not None:
             plt.close(figure)
     return output_path
+
+
+def format_measurement_annotation(plot_data: NPZPlotData) -> tuple[str, str]:
+    if plot_data.measurement_type == "DELAY":
+        return "Measurement: DELAY", f"Delay: {format_time_value(plot_data.measurement_s)}"
+    if plot_data.measurement_type == "CYCLES":
+        cycles = f"{plot_data.measurement_s:g}" if math.isfinite(plot_data.measurement_s) else "N/A"
+        return "Measurement: CYCLES", f"Cycles: {cycles}"
+    if plot_data.measurement_type == "PWID":
+        return (
+            "Measurement Type: PWID (Legacy)",
+            f"Positive Pulse Width: {format_time_value(plot_data.measurement_s)}",
+        )
+    return "Measurement Type: Unknown", "Advanced Measurement: N/A"
 
 
 def convert_csv_to_png(
@@ -336,7 +342,10 @@ def build_conversion_tasks(source: str | Path, output_directory: str | Path) -> 
     for data_file in files:
         relative = data_file.relative_to(source_root)
         kind = data_file.suffix.casefold().lstrip(".")
-        output_name = f"{data_file.stem}_{kind}.png"
+        if kind == "npz" and data_file.stem.endswith(("_delay", "_cycles")):
+            output_name = f"{data_file.stem}.png"
+        else:
+            output_name = f"{data_file.stem}_{kind}.png"
         tasks.append(
             ConversionTask(
                 source=data_file,

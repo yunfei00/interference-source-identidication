@@ -18,9 +18,11 @@ def test_config_loads_all_timing_values(tmp_path) -> None:
                     "channel": "C2",
                     "single_timeout_sec": 12.5,
                     "trigger_poll_interval_ms": 25,
-                    "delay_settle_delay_ms": 150,
-                    "delay_retry_delay_ms": 300,
-                    "delay_max_attempts": 4,
+                    "delay_time_scale_sec": 5e-7,
+                    "cycles_time_scale_sec": 1e-4,
+                    "measurement_settle_delay_ms": 150,
+                    "measurement_retry_delay_ms": 300,
+                    "measurement_max_attempts": 4,
                     "visa_timeout_ms": 45_000,
                     "chunk_size_mb": 8,
                     "reconnect_enabled": True,
@@ -29,8 +31,9 @@ def test_config_loads_all_timing_values(tmp_path) -> None:
                 },
                 "n9020a": {
                     "visa_timeout_ms": 7_000,
-                    "reconnect_delay_sec": 12,
-                    "reconnect_max_attempts": 4,
+                    "calibration_wait_sec": 12,
+                    "disconnect_reconnect_delay_sec": 2,
+                    "reconnect_max_attempts": 10,
                 },
                 "acquisition": {"max_sample_recovery_attempts": 7},
                 "delay_measurement_test": {
@@ -52,11 +55,15 @@ def test_config_loads_all_timing_values(tmp_path) -> None:
     assert config.scope.delay_settle_delay_sec == pytest.approx(0.15)
     assert config.scope.delay_retry_delay_sec == pytest.approx(0.3)
     assert config.scope.delay_max_attempts == 4
+    assert config.scope.measurement_max_attempts == 4
+    assert config.scope.delay_time_scale_sec == pytest.approx(5e-7)
+    assert config.scope.cycles_time_scale_sec == pytest.approx(1e-4)
     assert config.scope.visa_timeout_ms == 45_000
     assert config.scope.chunk_size_bytes == 8 * 1024 * 1024
     assert config.n9020a.visa_timeout_ms == 7_000
     assert config.scope.reconnect_delay_sec == 3
     assert config.n9020a.reconnect_delay_sec == 12
+    assert config.n9020a.disconnect_reconnect_delay_sec == 2
     assert config.acquisition.max_sample_recovery_attempts == 7
     assert config.delay_measurement_test.delays_ms == [0.0, 75.5]
     assert config.delay_measurement_test.samples_per_delay == 12
@@ -85,7 +92,8 @@ def test_missing_file_uses_defaults_and_can_generate_config(tmp_path) -> None:
     assert config == AppConfig()
     assert path.is_file()
     generated = json.loads(path.read_text(encoding="utf-8"))
-    assert generated["scope"]["delay_max_attempts"] == 3
+    assert generated["scope"]["measurement_max_attempts"] == 3
+    assert generated["n9020a"]["reconnect_max_attempts"] == 10
     assert "pwid_max_attempts" not in generated["scope"]
 
 
@@ -118,7 +126,7 @@ def test_packaged_app_prefers_config_beside_executable(monkeypatch, tmp_path) ->
         ("{broken", "Invalid JSON"),
         ('{"scope": {"single_timeout_sec": 0}}', "single_timeout_sec"),
         ('{"scope": {"trigger_poll_interval_ms": 0}}', "trigger_poll_interval_ms"),
-        ('{"scope": {"delay_max_attempts": 11}}', "delay_max_attempts"),
+        ('{"scope": {"measurement_max_attempts": 11}}', "measurement_max_attempts"),
         ('{"scope": {"channel": "C5"}}', "scope.channel"),
         ('{"delay_measurement_test": {"delays_ms": [-1]}}', "delays_ms"),
         ('{"delay_measurement_test": {"samples_per_delay": 0}}', "samples_per_delay"),
@@ -140,6 +148,7 @@ def test_legacy_pwid_fields_map_to_delay_and_new_fields_win(tmp_path) -> None:
                 "scope": {
                     "pwid_settle_delay_ms": 999,
                     "delay_settle_delay_ms": 123,
+                    "measurement_settle_delay_ms": 77,
                     "pwid_retry_delay_ms": 456,
                     "pwid_max_attempts": 4,
                 },
@@ -149,7 +158,7 @@ def test_legacy_pwid_fields_map_to_delay_and_new_fields_win(tmp_path) -> None:
         encoding="utf-8",
     )
     config = load_config(path)
-    assert config.scope.delay_settle_delay_ms == 123
+    assert config.scope.delay_settle_delay_ms == 77
     assert config.scope.delay_retry_delay_ms == 456
     assert config.scope.delay_max_attempts == 4
     assert config.delay_measurement_test.samples_per_delay == 9

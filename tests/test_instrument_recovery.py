@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import threading
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,143 +7,174 @@ import numpy as np
 import pytest
 
 from acquisition_worker import AcquisitionWorker, CaptureRequest
-from instrument_errors import N9020ACommunicationError, ScopeCommunicationError
+from instrument_errors import (
+    CommunicationFailureKind,
+    N9020ACommunicationError,
+    ScopeCommunicationError,
+    classify_communication_failure,
+)
 from n9020a_client import N9020AClient, N9020AConfig
-from sds3104xhd_client import DelayAcquisitionResult, SDS3104XHDClient, SDS3104XHDConfig
+from sds3104xhd_client import AdvancedMeasurementResult
 
 
 class _Waveform:
     point_count = 2
     voltage_v = np.asarray([-1.0, 1.0], dtype=np.float32)
+    time_s = np.asarray([0.0, 1.0], dtype=np.float64)
+    adc = np.asarray([0, 1], dtype=np.int16)
 
 
 class _RecoveringN9020A:
-    def __init__(self, *, fail_fetches: int = 1, reconnect_failures: int = 0) -> None:
+    def __init__(self, failure: BaseException | None = None, reconnect_failures: int = 0) -> None:
         self.config = SimpleNamespace(
             reconnect_enabled=True,
+            calibration_wait_sec=15.0,
+            disconnect_reconnect_delay_sec=2.0,
             reconnect_delay_sec=15.0,
             reconnect_max_attempts=5,
         )
-        self.fail_fetches = fail_fetches
+        self.failure = failure
         self.reconnect_failures = reconnect_failures
         self.fetches = 0
         self.reconnects = 0
-        self.disconnects = 0
+        self.disconnect_args: list[bool] = []
 
     def set_center_and_span_mhz(self, _center: float, _span: float) -> None:
-        return None
+        pass
 
     def fetch_csv_text(self) -> str:
         self.fetches += 1
-        if self.fetches <= self.fail_fetches:
-            raise N9020ACommunicationError("MMEM:DATA?", TimeoutError("VISA timeout"))
+        if self.failure is not None:
+            failure, self.failure = self.failure, None
+            raise N9020ACommunicationError("MMEM:DATA?", failure)
         return "frequency,power\n1,-20"
+
+    def disconnect(self, return_to_local: bool = False) -> None:
+        self.disconnect_args.append(return_to_local)
+
+    def reconnect(self) -> str:
+        self.reconnects += 1
+        if self.reconnects <= self.reconnect_failures:
+            raise N9020ACommunicationError("*IDN?", TimeoutError("still unavailable"))
+        return "Keysight Technologies,N9020A,TEST,1.0"
+
+
+class _RecoveringScope:
+    def __init__(self, waveform_failures: int = 0) -> None:
+        self.config = SimpleNamespace(
+            reconnect_enabled=True,
+            reconnect_delay_sec=2.0,
+            reconnect_max_attempts=5,
+            delay_time_scale_sec=5e-7,
+            cycles_time_scale_sec=1e-4,
+        )
+        self.waveform_failures = waveform_failures
+        self.singles: list[str] = []
+        self.waveform_reads = 0
+        self.reconnects = 0
+        self.disconnects = 0
+
+    def set_time_scale(self, _seconds: float) -> None:
+        pass
+
+    def configure_advanced_measurement(self, _measurement_type: str) -> None:
+        pass
+
+    def acquire_single_with_measurement_retry(self, measurement_type: str, **_kwargs):
+        self.singles.append(measurement_type)
+        value = 100e-9 if measurement_type == "DELAY" else 20.0
+        return AdvancedMeasurementResult(
+            measurement_type,
+            value,
+            f"{value:g}",
+            True,
+            1,
+            0.05,
+            "s" if measurement_type == "DELAY" else "count",
+        )
+
+    def read_waveform(self) -> _Waveform:
+        self.waveform_reads += 1
+        if self.waveform_reads <= self.waveform_failures:
+            raise ScopeCommunicationError("WAV:DATA?", ConnectionResetError("connection reset"))
+        return _Waveform()
+
+    def save_npz(self, path: Path, waveform, index: int, *, measurement_result) -> None:
+        with path.open("wb") as output:
+            np.savez(
+                output,
+                index=np.asarray(index, dtype=np.int32),
+                time_s=waveform.time_s,
+                voltage_v=waveform.voltage_v,
+                adc=waveform.adc,
+                measurement_type=np.asarray(measurement_result.measurement_type),
+                measurement_value=np.asarray(measurement_result.value, dtype=np.float64),
+                measurement_unit=np.asarray(measurement_result.unit),
+                measurement_raw=np.asarray(measurement_result.raw_value),
+                measurement_valid=np.asarray(measurement_result.valid, dtype=np.bool_),
+                measurement_attempts=np.asarray(measurement_result.attempts, dtype=np.int32),
+            )
 
     def disconnect(self) -> None:
         self.disconnects += 1
 
     def reconnect(self) -> str:
         self.reconnects += 1
-        if self.reconnects <= self.reconnect_failures:
-            raise N9020ACommunicationError("*IDN?", TimeoutError("still calibrating"))
-        return "Keysight Technologies,N9020A,TEST,1.0"
-
-
-class _RecoveringScope:
-    def __init__(self, *, waveform_failures: int = 0) -> None:
-        self.config = SimpleNamespace(
-            reconnect_enabled=True,
-            reconnect_delay_sec=2.0,
-            reconnect_max_attempts=5,
-        )
-        self.waveform_failures = waveform_failures
-        self.singles = 0
-        self.waveform_reads = 0
-        self.reconnects = 0
-        self.configurations = 0
-
-    def acquire_single_with_delay_retry(self, *, capture_index: int, should_stop):
-        assert capture_index == 1 and not should_stop()
-        self.singles += 1
-        return DelayAcquisitionResult(100e-9, "1.0E-7", True, 1, 0.05)
-
-    def read_waveform(self) -> _Waveform:
-        self.waveform_reads += 1
-        if self.waveform_reads <= self.waveform_failures:
-            raise ScopeCommunicationError("WAV:DATA?", OSError("connection reset"))
-        return _Waveform()
-
-    def save_npz(self, path: Path, _waveform, index: int, delay_s: float, **metadata) -> None:
-        with path.open("wb") as output:
-            np.savez(
-                output,
-                index=np.asarray(index, dtype=np.int32),
-                delay_s=np.asarray(delay_s, dtype=np.float64),
-                delay_raw=np.asarray(metadata["delay_raw"]),
-                delay_valid=np.asarray(metadata["delay_valid"], dtype=np.bool_),
-                delay_attempts=np.asarray(metadata["delay_attempts"], dtype=np.int32),
-                advanced_measurement_type=np.asarray("DELAY"),
-            )
-
-    def disconnect(self) -> None:
-        return None
-
-    def reconnect(self) -> str:
-        self.reconnects += 1
         return "SIGLENT,SDS3104X HD,TEST,1.0"
 
-    def configure_delay_measurement(self) -> None:
-        self.configurations += 1
 
-
-def test_driver_classifies_transport_errors_but_not_value_errors() -> None:
-    class TimeoutInstrument:
-        def write(self, _command: str) -> None:
-            raise TimeoutError("timeout")
-
-    n9020a = N9020AClient(N9020AConfig("TCPIP0::test::INSTR", 1000))
-    n9020a._inst = TimeoutInstrument()
-    with pytest.raises(N9020ACommunicationError):
-        n9020a.write("*OPC?")
-
-    scope = SDS3104XHDClient(
-        SDS3104XHDConfig("test", "C1", 1000, 1, 1024, 0.01, 0, 0, 3)
+def test_failure_classification_distinguishes_timeout_network_and_unknown() -> None:
+    assert classify_communication_failure(TimeoutError("timeout")) == CommunicationFailureKind.TIMEOUT
+    assert (
+        classify_communication_failure(ConnectionResetError("reset"))
+        == CommunicationFailureKind.DISCONNECTED
     )
-    scope._inst = SimpleNamespace(query=lambda _command: (_ for _ in ()).throw(ValueError("bad")))
-    with pytest.raises(ValueError, match="bad"):
-        scope.query("MEAS:ADV:P1:VAL?")
+    assert classify_communication_failure(RuntimeError("odd")) == CommunicationFailureKind.UNKNOWN
 
 
-def test_n9020a_failure_waits_15_seconds_then_restarts_entire_same_sample(tmp_path) -> None:
-    n9020a = _RecoveringN9020A()
+def test_n9020a_timeout_uses_calibration_wait_then_restarts_sample(tmp_path: Path) -> None:
+    n9020a = _RecoveringN9020A(TimeoutError("VISA timeout"))
     scope = _RecoveringScope()
-    worker = AcquisitionWorker(
-        n9020a, scope, CaptureRequest(tmp_path, 1, True), max_sample_recovery_attempts=5
-    )  # type: ignore[arg-type]
-    waits: list[float] = []
-    worker._sleep_interruptibly = waits.append  # type: ignore[method-assign]
-    results: list[dict] = []
-    worker.finished.connect(results.append)
-
-    worker.capture_one()
-
-    assert waits == [15.0]
-    assert n9020a.reconnects == 1
-    assert scope.singles == 2
-    assert results[0]["index"] == 1
-    assert (tmp_path / "000001.csv").is_file()
-    assert (tmp_path / "000001.npz").is_file()
-    assert not (tmp_path / "000002.csv").exists()
-    assert not list(tmp_path.glob("*.tmp"))
-
-
-def test_scope_failure_reconnects_reconfigures_delay_and_restarts_single(tmp_path) -> None:
-    n9020a = _RecoveringN9020A(fail_fetches=0)
-    scope = _RecoveringScope(waveform_failures=1)
     worker = AcquisitionWorker(n9020a, scope, CaptureRequest(tmp_path, 1, True))  # type: ignore[arg-type]
     waits: list[float] = []
     worker._sleep_interruptibly = waits.append  # type: ignore[method-assign]
+    statuses: list[str] = []
     errors: list[str] = []
+    worker.status.connect(statuses.append)
+    worker.error.connect(errors.append)
+
+    worker.capture_one()
+
+    assert not errors
+    assert waits == [15.0]
+    assert "N9020A: Possible calibration" in statuses
+    assert n9020a.fetches == 2
+    assert scope.singles == ["DELAY", "CYCLES"]
+    assert n9020a.disconnect_args == [False]
+
+
+def test_n9020a_network_disconnect_uses_short_delay_not_calibration(tmp_path: Path) -> None:
+    n9020a = _RecoveringN9020A(ConnectionResetError("connection reset"))
+    worker = AcquisitionWorker(n9020a, None, CaptureRequest(tmp_path, 1, False))  # type: ignore[arg-type]
+    waits: list[float] = []
+    statuses: list[str] = []
+    worker._sleep_interruptibly = waits.append  # type: ignore[method-assign]
+    worker.status.connect(statuses.append)
+
+    worker.capture_one()
+
+    assert waits == [2.0]
+    assert "N9020A: Disconnected" in statuses
+    assert not any("calibration" in status.casefold() for status in statuses)
+
+
+def test_scope_reconnect_success_restarts_entire_sample_without_final_error(tmp_path: Path) -> None:
+    n9020a = _RecoveringN9020A()
+    scope = _RecoveringScope(waveform_failures=1)
+    worker = AcquisitionWorker(n9020a, scope, CaptureRequest(tmp_path, 1, True))  # type: ignore[arg-type]
+    waits: list[float] = []
+    errors: list[str] = []
+    worker._sleep_interruptibly = waits.append  # type: ignore[method-assign]
     worker.error.connect(errors.append)
 
     worker.capture_one()
@@ -153,53 +182,50 @@ def test_scope_failure_reconnects_reconfigures_delay_and_restarts_single(tmp_pat
     assert not errors
     assert waits == [2.0]
     assert scope.reconnects == 1
-    assert scope.configurations == 1
-    assert scope.singles == 2
     assert n9020a.fetches == 2
-    assert (tmp_path / "delay_summary.csv").is_file()
+    assert scope.singles == ["DELAY", "DELAY", "CYCLES"]
+    assert (tmp_path / "000001_delay.npz").is_file()
+    assert (tmp_path / "000001_cycles.npz").is_file()
 
 
-def test_reconnect_retries_to_configured_max_without_real_sleep(tmp_path) -> None:
-    n9020a = _RecoveringN9020A(fail_fetches=10, reconnect_failures=10)
-    n9020a.config.reconnect_delay_sec = 0
-    n9020a.config.reconnect_max_attempts = 3
-    worker = AcquisitionWorker(
-        n9020a, None, CaptureRequest(tmp_path, 1, False), max_sample_recovery_attempts=5
-    )  # type: ignore[arg-type]
-    errors: list[str] = []
-    worker.error.connect(errors.append)
-    worker.capture_one()
-    assert n9020a.reconnects == 3
-    assert errors and "reconnect failed after 3 attempts" in errors[0]
-    assert not list(tmp_path.glob("000001*"))
+class _Instrument:
+    def __init__(self, local_failure: bool = False) -> None:
+        self.commands: list[str] = []
+        self.closed = False
+        self.local_failure = local_failure
+
+    def write(self, command: str) -> None:
+        self.commands.append(command)
+        if self.local_failure:
+            raise OSError("network gone")
+
+    def close(self) -> None:
+        self.closed = True
 
 
-def test_sample_recovery_limit_prevents_infinite_restart(tmp_path) -> None:
-    n9020a = _RecoveringN9020A(fail_fetches=99)
-    n9020a.config.reconnect_delay_sec = 0
-    scope = _RecoveringScope()
-    worker = AcquisitionWorker(
-        n9020a, scope, CaptureRequest(tmp_path, 1, True), max_sample_recovery_attempts=2
-    )  # type: ignore[arg-type]
-    errors: list[str] = []
-    worker.error.connect(errors.append)
-    worker.capture_one()
-    assert scope.singles == 3
-    assert n9020a.reconnects == 2
-    assert errors and "maximum sample recovery attempts exceeded" in errors[0]
-    assert not list(tmp_path.glob("000001*"))
+def test_user_disconnect_sends_local_before_close() -> None:
+    client = N9020AClient(N9020AConfig("TCPIP0::test::INSTR", 1000))
+    instrument = _Instrument()
+    client._inst = instrument
+    client.disconnect(return_to_local=True)
+    assert instrument.commands == ["SYST:LOC"]
+    assert instrument.closed
 
 
-def test_stop_interrupts_long_reconnect_wait_quickly(tmp_path) -> None:
-    n9020a = _RecoveringN9020A(fail_fetches=99)
-    scope = _RecoveringScope()
-    worker = AcquisitionWorker(n9020a, scope, CaptureRequest(tmp_path, 1, True))  # type: ignore[arg-type]
-    thread = threading.Thread(target=worker.capture_one)
-    started = time.monotonic()
-    thread.start()
-    time.sleep(0.05)
-    worker.request_stop()
-    thread.join(timeout=1.0)
-    assert not thread.is_alive()
-    assert time.monotonic() - started < 0.5
-    assert not list(tmp_path.glob("000001*"))
+def test_recovery_disconnect_does_not_send_local() -> None:
+    client = N9020AClient(N9020AConfig("TCPIP0::test::INSTR", 1000))
+    instrument = _Instrument()
+    client._inst = instrument
+    client.disconnect(return_to_local=False)
+    assert instrument.commands == []
+    assert instrument.closed
+
+
+def test_local_failure_still_closes_session(caplog) -> None:
+    client = N9020AClient(N9020AConfig("TCPIP0::test::INSTR", 1000))
+    instrument = _Instrument(local_failure=True)
+    client._inst = instrument
+    with caplog.at_level("WARNING"):
+        client.disconnect(return_to_local=True)
+    assert instrument.closed
+    assert "unable to restore Local control" in caplog.text

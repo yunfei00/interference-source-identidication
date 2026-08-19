@@ -79,6 +79,20 @@ class SDS3104XHDConfig:
     reconnect_enabled: bool = True
     reconnect_delay_sec: float = 2.0
     reconnect_max_attempts: int = 5
+    delay_time_scale_sec: float = 5.0e-7
+    cycles_time_scale_sec: float = 1.0e-4
+
+    @property
+    def measurement_settle_delay_sec(self) -> float:
+        return self.delay_settle_delay_sec
+
+    @property
+    def measurement_retry_delay_sec(self) -> float:
+        return self.delay_retry_delay_sec
+
+    @property
+    def measurement_max_attempts(self) -> int:
+        return self.delay_max_attempts
 
 
 @dataclass(frozen=True)
@@ -122,12 +136,48 @@ class ScopeWaveform:
 
 
 @dataclass(frozen=True)
-class DelayAcquisitionResult:
-    delay_s: float
-    delay_raw: str
-    delay_valid: bool
+class AdvancedMeasurementResult:
+    measurement_type: str
+    value: float
+    raw_value: str
+    valid: bool
     attempts: int
     single_seconds: float
+    unit: str
+
+    @property
+    def delay_s(self) -> float:
+        return self.value if self.measurement_type == "DELAY" else float("nan")
+
+    @property
+    def delay_raw(self) -> str:
+        return self.raw_value
+
+    @property
+    def delay_valid(self) -> bool:
+        return self.valid if self.measurement_type == "DELAY" else False
+
+
+class DelayAcquisitionResult(AdvancedMeasurementResult):
+    """Backward-compatible DELAY result constructor."""
+
+    def __init__(
+        self,
+        delay_s: float,
+        delay_raw: str,
+        delay_valid: bool,
+        attempts: int,
+        single_seconds: float,
+    ) -> None:
+        super().__init__(
+            measurement_type="DELAY",
+            value=delay_s,
+            raw_value=delay_raw,
+            valid=delay_valid,
+            attempts=attempts,
+            single_seconds=single_seconds,
+            unit="s",
+        )
 
 
 class AcquisitionStopped(RuntimeError):
@@ -244,6 +294,9 @@ def parse_delay_value(raw: object) -> float:
     return value if math.isfinite(value) else float("nan")
 
 
+parse_advanced_measurement_value = parse_delay_value
+
+
 class SDS3104XHDClient:
     """PyVISA driver for single-shot SDS3104X HD waveform capture."""
 
@@ -266,7 +319,7 @@ class SDS3104XHDClient:
             self._inst.timeout = self.config.timeout_ms
             self._inst.chunk_size = self.config.chunk_size
             self._idn = self.identify()
-            self.configure_delay_measurement()
+            self.write(f":WAVeform:SOURce {self.config.channel}")
         except Exception as exc:
             self.disconnect()
             if is_communication_exception(exc):
@@ -304,8 +357,20 @@ class SDS3104XHDClient:
 
     def configure_delay_measurement(self) -> None:
         """Configure advanced measurement P1 as DELAY."""
-        self.write("MEAS:ADV:P1:TYPE DELAY")
-        logger.info("[SDS3104XHD] advanced measurement configured: DELAY")
+        self.configure_advanced_measurement("DELAY")
+
+    def set_time_scale(self, seconds: float) -> None:
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError("Scope time scale must be a positive finite number")
+        value = f"{seconds:.2E}".replace("E-0", "E-").replace("E+0", "E+")
+        self.write(f":TIM:SCAL {value}")
+
+    def configure_advanced_measurement(self, measurement_type: str) -> None:
+        selected = measurement_type.strip().upper()
+        if selected not in {"DELAY", "CYCLES"}:
+            raise ValueError(f"Unsupported advanced measurement type: {measurement_type}")
+        self.write(f"MEAS:ADV:P1:TYPE {selected}")
+        logger.info("[SDS3104XHD] advanced measurement configured: %s", selected)
 
     def read_delay_value(self, capture_index: int | None = None) -> float:
         """Read P1 in seconds; invalid values become NaN and I/O errors propagate."""
@@ -316,14 +381,59 @@ class SDS3104XHDClient:
             logger.warning("%s[SDS3104XHD] DELAY unavailable: %s", prefix, raw or "<empty>")
         return value
 
+    def read_advanced_measurement_value(
+        self,
+        measurement_type: str,
+        capture_index: int | None = None,
+    ) -> float:
+        selected = measurement_type.strip().upper()
+        if selected not in {"DELAY", "CYCLES"}:
+            raise ValueError(f"Unsupported advanced measurement type: {measurement_type}")
+        prefix = f"[{capture_index:06d}] " if capture_index is not None else ""
+        raw = self.query("MEAS:ADV:P1:VAL?").strip()
+        value = parse_advanced_measurement_value(raw)
+        if math.isnan(value):
+            logger.warning(
+                "%s[SDS3104XHD] %s unavailable: %s",
+                prefix,
+                selected,
+                raw or "<empty>",
+            )
+        return value
+
     def acquire_single_with_delay_retry(
         self,
         *,
         capture_index: int | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> DelayAcquisitionResult:
-        """Acquire fresh Single frames until DELAY is valid or attempts are exhausted."""
-        attempt_limit = self.config.delay_max_attempts
+        """Compatibility wrapper for the generic advanced-measurement retry path."""
+        result = self.acquire_single_with_measurement_retry(
+            "DELAY",
+            capture_index=capture_index,
+            should_stop=should_stop,
+        )
+        return DelayAcquisitionResult(
+            result.value,
+            result.raw_value,
+            result.valid,
+            result.attempts,
+            result.single_seconds,
+        )
+
+    def acquire_single_with_measurement_retry(
+        self,
+        measurement_type: str,
+        *,
+        capture_index: int | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> AdvancedMeasurementResult:
+        """Acquire independent Single frames until P1 is valid or retries are exhausted."""
+        selected = measurement_type.strip().upper()
+        if selected not in {"DELAY", "CYCLES"}:
+            raise ValueError(f"Unsupported advanced measurement type: {measurement_type}")
+        unit = "s" if selected == "DELAY" else "count"
+        attempt_limit = self.config.measurement_max_attempts
         if attempt_limit < 1:
             raise ValueError("max_attempts must be at least 1")
 
@@ -351,51 +461,58 @@ class SDS3104XHDClient:
                 raise AcquisitionStopped("Capture stopped after Scope Single")
 
             logger.info(
-                "%s[SDS3104XHD] waiting %.1f ms before DELAY query",
+                "%s[SDS3104XHD] waiting %.1f ms before %s query",
                 prefix,
-                self.config.delay_settle_delay_sec * 1000.0,
+                self.config.measurement_settle_delay_sec * 1000.0,
+                selected,
             )
-            self._sleep_interruptibly(self.config.delay_settle_delay_sec, should_stop)
+            self._sleep_interruptibly(self.config.measurement_settle_delay_sec, should_stop)
 
             # Query errors are communication failures and must follow the device error path.
             last_raw = self.query("MEAS:ADV:P1:VAL?").strip()
-            delay_s = parse_delay_value(last_raw)
-            if math.isfinite(delay_s):
-                logger.info(
-                    "%s[SDS3104XHD] DELAY = %s",
-                    prefix,
-                    format_time_value(delay_s),
-                )
-                return DelayAcquisitionResult(
-                    delay_s=delay_s,
-                    delay_raw=last_raw,
-                    delay_valid=True,
+            value = parse_advanced_measurement_value(last_raw)
+            if math.isfinite(value):
+                display = format_time_value(value) if selected == "DELAY" else f"{value:g} count"
+                logger.info("%s[SDS3104XHD] %s = %s", prefix, selected, display)
+                return AdvancedMeasurementResult(
+                    measurement_type=selected,
+                    value=value,
+                    raw_value=last_raw,
+                    valid=True,
                     attempts=attempt,
                     single_seconds=last_single_seconds,
+                    unit=unit,
                 )
 
             logger.warning(
-                "%s[SDS3104XHD] DELAY unavailable: %s", prefix, last_raw or "<empty>"
+                "%s[SDS3104XHD] %s unavailable: %s",
+                prefix,
+                selected,
+                last_raw or "<empty>",
             )
             if attempt < attempt_limit:
                 logger.info(
-                    "%s[SDS3104XHD] waiting %.1f ms before DELAY retry",
+                    "%s[SDS3104XHD] waiting %.1f ms before %s retry",
                     prefix,
-                    self.config.delay_retry_delay_sec * 1000.0,
+                    self.config.measurement_retry_delay_sec * 1000.0,
+                    selected,
                 )
-                self._sleep_interruptibly(self.config.delay_retry_delay_sec, should_stop)
+                self._sleep_interruptibly(self.config.measurement_retry_delay_sec, should_stop)
 
         logger.warning(
-            "%s[SDS3104XHD] DELAY unavailable after %d Single attempts; using last acquisition",
+            "%s[SDS3104XHD] %s unavailable after %d Single attempts; using last acquisition",
             prefix,
+            selected,
             attempt_limit,
         )
-        return DelayAcquisitionResult(
-            delay_s=float("nan"),
-            delay_raw=last_raw,
-            delay_valid=False,
+        return AdvancedMeasurementResult(
+            measurement_type=selected,
+            value=float("nan"),
+            raw_value=last_raw,
+            valid=False,
             attempts=attempt_limit,
             single_seconds=last_single_seconds,
+            unit=unit,
         )
 
     @staticmethod
@@ -518,39 +635,77 @@ class SDS3104XHDClient:
         delay_raw: str = "",
         delay_valid: bool | None = None,
         delay_attempts: int = 1,
+        *,
+        measurement_result: AdvancedMeasurementResult | None = None,
+        measurement_type: str = "DELAY",
+        measurement_value: float | None = None,
+        measurement_unit: str | None = None,
+        measurement_raw: str | None = None,
+        measurement_valid: bool | None = None,
+        measurement_attempts: int | None = None,
     ) -> None:
         output_path = Path(path)
         preamble = waveform.preamble
         sample_rate = 1.0 / preamble.interval
         device = self._idn or "SIGLENT SDS3104X HD"
-        measurement_valid = (
-            math.isfinite(delay_s)
-            if delay_valid is None
-            else bool(delay_valid) and math.isfinite(delay_s)
-        )
-        with output_path.open("wb") as output_file:
-            np.savez_compressed(
-                output_file,
-                index=np.asarray(index, dtype=np.int32),
-                time_s=waveform.time_s.astype(np.float64, copy=False),
-                voltage_v=waveform.voltage_v.astype(np.float32, copy=False),
-                adc=waveform.adc.astype(np.int16, copy=False),
-                delay_s=np.asarray(delay_s, dtype=np.float64),
-                delay_raw=np.asarray(delay_raw, dtype=np.str_),
-                delay_valid=np.asarray(measurement_valid, dtype=np.bool_),
-                delay_attempts=np.asarray(delay_attempts, dtype=np.int32),
-                advanced_measurement_type=np.asarray("DELAY", dtype=np.str_),
-                device=np.asarray(device),
-                ip=np.asarray(self.config.ip),
-                channel=np.asarray(self.config.channel),
-                point_count=np.asarray(waveform.point_count, dtype=np.int32),
-                adc_bit=np.asarray(preamble.adc_bit, dtype=np.int16),
-                vdiv=np.asarray(preamble.vdiv, dtype=np.float32),
-                offset=np.asarray(preamble.offset, dtype=np.float32),
-                probe=np.asarray(preamble.probe, dtype=np.float32),
-                code_per_div=np.asarray(preamble.code, dtype=np.float32),
-                interval=np.asarray(preamble.interval, dtype=np.float64),
-                sample_rate=np.asarray(sample_rate, dtype=np.float64),
-                tdiv=np.asarray(preamble.tdiv, dtype=np.float64),
-                delay=np.asarray(preamble.delay, dtype=np.float64),
+        if measurement_result is not None:
+            selected_type = measurement_result.measurement_type
+            selected_value = measurement_result.value
+            selected_unit = measurement_result.unit
+            selected_raw = measurement_result.raw_value
+            selected_valid = measurement_result.valid and math.isfinite(selected_value)
+            selected_attempts = measurement_result.attempts
+        else:
+            selected_type = measurement_type.strip().upper()
+            selected_value = delay_s if measurement_value is None else measurement_value
+            selected_unit = measurement_unit or ("s" if selected_type == "DELAY" else "count")
+            selected_raw = delay_raw if measurement_raw is None else measurement_raw
+            requested_valid = delay_valid if measurement_valid is None else measurement_valid
+            selected_valid = (
+                math.isfinite(selected_value)
+                if requested_valid is None
+                else bool(requested_valid) and math.isfinite(selected_value)
             )
+            selected_attempts = (
+                delay_attempts if measurement_attempts is None else measurement_attempts
+            )
+        if selected_type not in {"DELAY", "CYCLES"}:
+            raise ValueError(f"Unsupported advanced measurement type: {selected_type}")
+
+        metadata = {
+            "index": np.asarray(index, dtype=np.int32),
+            "time_s": waveform.time_s.astype(np.float64, copy=False),
+            "voltage_v": waveform.voltage_v.astype(np.float32, copy=False),
+            "adc": waveform.adc.astype(np.int16, copy=False),
+            "measurement_type": np.asarray(selected_type, dtype=np.str_),
+            "measurement_value": np.asarray(selected_value, dtype=np.float64),
+            "measurement_unit": np.asarray(selected_unit, dtype=np.str_),
+            "measurement_raw": np.asarray(selected_raw, dtype=np.str_),
+            "measurement_valid": np.asarray(selected_valid, dtype=np.bool_),
+            "measurement_attempts": np.asarray(selected_attempts, dtype=np.int32),
+            "advanced_measurement_type": np.asarray(selected_type, dtype=np.str_),
+            "device": np.asarray(device),
+            "ip": np.asarray(self.config.ip),
+            "channel": np.asarray(self.config.channel),
+            "point_count": np.asarray(waveform.point_count, dtype=np.int32),
+            "adc_bit": np.asarray(preamble.adc_bit, dtype=np.int16),
+            "vdiv": np.asarray(preamble.vdiv, dtype=np.float32),
+            "offset": np.asarray(preamble.offset, dtype=np.float32),
+            "probe": np.asarray(preamble.probe, dtype=np.float32),
+            "code_per_div": np.asarray(preamble.code, dtype=np.float32),
+            "interval": np.asarray(preamble.interval, dtype=np.float64),
+            "sample_rate": np.asarray(sample_rate, dtype=np.float64),
+            "tdiv": np.asarray(preamble.tdiv, dtype=np.float64),
+            "delay": np.asarray(preamble.delay, dtype=np.float64),
+        }
+        # Preserve the v0.0.10 DELAY keys so older readers can still consume new
+        # DELAY files. CYCLES never receives time-valued aliases.
+        if selected_type == "DELAY":
+            metadata.update(
+                delay_s=np.asarray(selected_value, dtype=np.float64),
+                delay_raw=np.asarray(selected_raw, dtype=np.str_),
+                delay_valid=np.asarray(selected_valid, dtype=np.bool_),
+                delay_attempts=np.asarray(selected_attempts, dtype=np.int32),
+            )
+        with output_path.open("wb") as output_file:
+            np.savez_compressed(output_file, **metadata)

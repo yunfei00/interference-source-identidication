@@ -57,6 +57,23 @@ def _write_delay_npz(path: Path, delay_s: float = 1.0e-7) -> None:
     )
 
 
+def _write_generic_npz(path: Path, kind: str, value: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        path,
+        index=np.asarray(1, dtype=np.int32),
+        time_s=np.asarray([-1e-6, 0, 1e-6], dtype=np.float64),
+        voltage_v=np.asarray([-1, 0, 1], dtype=np.float32),
+        adc=np.asarray([-1, 0, 1], dtype=np.int16),
+        measurement_type=np.asarray(kind),
+        measurement_value=np.asarray(value, dtype=np.float64),
+        measurement_unit=np.asarray("s" if kind == "DELAY" else "count"),
+        measurement_raw=np.asarray(f"{value:g}"),
+        measurement_valid=np.asarray(True, dtype=np.bool_),
+        measurement_attempts=np.asarray(1, dtype=np.int32),
+    )
+
+
 @pytest.mark.parametrize(
     ("directory_name", "expected"),
     [
@@ -297,3 +314,34 @@ def test_legacy_report_is_explicitly_labeled_and_not_mixed_with_delay(tmp_path: 
         encoding="utf-8"
     )
     assert "Measurement Type: PWID (Legacy)" in report
+
+
+def test_dual_export_uses_distinct_scope_outputs_summary_and_report(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    folder = data_root / "600.000MHz"
+    _write_n9020a_csv(folder / "000001.csv")
+    _write_generic_npz(folder / "000001_delay.npz", "DELAY", 134.47e-9)
+    _write_generic_npz(folder / "000001_cycles.npz", "CYCLES", 23.0)
+    output = data_root / "export"
+
+    result = run_data_export(
+        data_root,
+        output,
+        ExportOptions(
+            scope_csv=True,
+            scope_png=True,
+            measurement_summary=True,
+            html_report=True,
+        ),
+    )
+
+    assert result.failed == 0, result.errors
+    assert (folder / "measurement_summary.csv").is_file()
+    assert (output / "scope_csv" / "600.000MHz" / "000001_delay_scope.csv").is_file()
+    assert (output / "scope_csv" / "600.000MHz" / "000001_cycles_scope.csv").is_file()
+    assert (output / "images" / "600.000MHz" / "000001_delay.png").is_file()
+    assert (output / "images" / "600.000MHz" / "000001_cycles.png").is_file()
+    report = (output / "reports" / "measurement_report.html").read_text(encoding="utf-8")
+    assert "DELAY Analysis" in report
+    assert "CYCLES Analysis" in report
+    assert "Cycles (count)" in report
